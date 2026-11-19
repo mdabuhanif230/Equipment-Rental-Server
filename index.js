@@ -125,6 +125,7 @@ const publicUser = (u) => ({
   role: u.role,
   photoURL: u.photoURL || "",
   phone: u.phone || "",
+  address: u.address || "",
   createdAt: u.createdAt,
 });
 const signToken = (user) => jwt.sign({ id: user._id.toString() }, JWT_SECRET, { expiresIn: "7d" });
@@ -442,6 +443,7 @@ app.patch(
     }
     if (req.body.photoURL !== undefined) update.photoURL = str(req.body.photoURL, 500);
     if (req.body.phone !== undefined) update.phone = str(req.body.phone, 30);
+    if (req.body.address !== undefined) update.address = str(req.body.address, 300);
     if (!Object.keys(update).length) throw new HttpError(400, "Nothing to update");
     await col.users.updateOne({ _id: req.user._id }, { $set: update }); // role is never updatable here
     const user = await col.users.findOne({ _id: req.user._id });
