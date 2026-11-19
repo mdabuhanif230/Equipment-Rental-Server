@@ -960,6 +960,87 @@ app.get(
 );
 
 // ---------------------------------------------------------------------
+// 16. ROUTES - DASHBOARD ANALYTICS (real MongoDB aggregations)
+// ---------------------------------------------------------------------
+const monthKey = (field) => ({ $dateToString: { format: "%Y-%m", date: field } });
+
+app.get(
+  "/api/stats/admin",
+  verifyAdmin,
+  wrap(async (req, res) => {
+    const [totalUsers, totalEquipment, totalBookings, pendingApprovals, completedRentals, revenue, monthlyBookings, usersByRole] =
+      await Promise.all([
+        col.users.countDocuments(),
+        col.equipment.countDocuments(),
+        col.bookings.countDocuments(),
+        col.equipment.countDocuments({ status: "pending" }),
+        col.bookings.countDocuments({ status: "completed" }),
+        col.payments.aggregate([{ $group: { _id: null, total: { $sum: "$amount" } } }]).toArray(),
+        col.bookings
+          .aggregate([
+            { $group: { _id: monthKey("$createdAt"), bookings: { $sum: 1 } } },
+            { $sort: { _id: -1 } },
+            { $limit: 12 },
+            { $sort: { _id: 1 } },
+            { $project: { _id: 0, month: "$_id", bookings: 1 } },
+          ])
+          .toArray(),
+        col.users.aggregate([{ $group: { _id: "$role", count: { $sum: 1 } } }, { $project: { _id: 0, role: "$_id", count: 1 } }]).toArray(),
+      ]);
+    res.json({
+      totalUsers,
+      totalEquipment,
+      totalBookings,
+      pendingApprovals,
+      completedRentals,
+      totalRevenue: money(revenue[0]?.total || 0),
+      monthlyBookings,
+      usersByRole,
+    });
+  })
+);
+
+app.get(
+  "/api/stats/owner",
+  verifyOwner,
+  wrap(async (req, res) => {
+    const ownerId = req.user._id;
+    const [totalListed, completedRentals, earnings, monthlyEarnings] = await Promise.all([
+      col.equipment.countDocuments({ ownerId }),
+      col.bookings.countDocuments({ ownerId, status: "completed" }),
+      col.payments.aggregate([{ $match: { ownerId } }, { $group: { _id: null, total: { $sum: "$amount" } } }]).toArray(),
+      col.payments
+        .aggregate([
+          { $match: { ownerId } },
+          { $group: { _id: monthKey("$createdAt"), earnings: { $sum: "$amount" } } },
+          { $sort: { _id: -1 } },
+          { $limit: 12 },
+          { $sort: { _id: 1 } },
+          { $project: { _id: 0, month: "$_id", earnings: { $round: ["$earnings", 2] } } },
+        ])
+        .toArray(),
+    ]);
+    res.json({ totalListed, completedRentals, totalEarnings: money(earnings[0]?.total || 0), monthlyEarnings });
+  })
+);
+
+app.get(
+  "/api/stats/customer",
+  verifyRenter,
+  wrap(async (req, res) => {
+    const customerId = req.user._id;
+    const [totalRentals, activeRentals, completedRentals, favorites, spent] = await Promise.all([
+      col.bookings.countDocuments({ customerId }),
+      col.bookings.countDocuments({ customerId, status: "confirmed" }),
+      col.bookings.countDocuments({ customerId, status: "completed" }),
+      col.favorites.countDocuments({ userId: customerId }),
+      col.payments.aggregate([{ $match: { customerId } }, { $group: { _id: null, total: { $sum: "$amount" } } }]).toArray(),
+    ]);
+    res.json({ totalRentals, activeRentals, completedRentals, favorites, totalSpent: money(spent[0]?.total || 0) });
+  })
+);
+
+// ---------------------------------------------------------------------
 // 17. 404 + ERROR HANDLER
 // ---------------------------------------------------------------------
 app.use((req, res) => res.status(404).json({ message: `Route not found: ${req.method} ${req.originalUrl}` }));
