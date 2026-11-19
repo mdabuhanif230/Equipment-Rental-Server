@@ -540,6 +540,136 @@ app.get(
 );
 
 // ---------------------------------------------------------------------
+// 11. ROUTES - EQUIPMENT (owner)
+// ---------------------------------------------------------------------
+app.post(
+  "/api/equipment",
+  verifyOwner,
+  wrap(async (req, res) => {
+    const data = validateEquipment(req.body);
+    const item = {
+      ...data,
+      status: "pending", // admin must approve
+      ownerId: req.user._id, // owner info comes from the token, not from the client
+      ownerName: req.user.name,
+      ownerEmail: req.user.email,
+      ownerPhoto: req.user.photoURL || "",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+    item._id = (await col.equipment.insertOne(item)).insertedId;
+    res.status(201).json({ item });
+  })
+);
+
+app.get(
+  "/api/owner/equipment",
+  verifyOwner,
+  wrap(async (req, res) => {
+    const { page, limit, skip } = paginate(req);
+    const filter = { ownerId: req.user._id };
+    const [items, total] = await Promise.all([
+      col.equipment.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+      col.equipment.countDocuments(filter),
+    ]);
+    res.json(pageResult(items, total, page, limit));
+  })
+);
+
+app.put(
+  "/api/equipment/:id",
+  verifyOwner,
+  wrap(async (req, res) => {
+    const _id = oid(req.params.id);
+    const data = validateEquipment(req.body);
+    // After an edit the listing goes back to "pending" for admin re-approval
+    const result = await col.equipment.findOneAndUpdate(
+      { _id, ownerId: req.user._id },
+      { $set: { ...data, status: "pending", updatedAt: new Date() } },
+      { returnDocument: "after" }
+    );
+    if (!result) throw new HttpError(404, "Equipment not found or not yours");
+    res.json({ item: result });
+  })
+);
+
+app.delete(
+  "/api/equipment/:id",
+  verifyToken,
+  wrap(async (req, res) => {
+    if (!["owner", "admin"].includes(req.user.role)) throw new HttpError(403, "Forbidden");
+    const _id = oid(req.params.id);
+    const filter = req.user.role === "admin" ? { _id } : { _id, ownerId: req.user._id };
+    const item = await col.equipment.findOne(filter);
+    if (!item) throw new HttpError(404, "Equipment not found or not yours");
+
+    const active = await col.bookings.countDocuments({
+      equipmentId: _id,
+      $or: [{ status: "confirmed" }, { status: "pending", holdUntil: { $gt: new Date() } }],
+    });
+    if (active > 0) throw new HttpError(409, "Cannot delete equipment with active bookings");
+
+    await col.equipment.deleteOne({ _id });
+    await col.favorites.deleteMany({ equipmentId: _id });
+    res.json({ message: "Equipment deleted" });
+  })
+);
+
+// ---------------------------------------------------------------------
+// 12. ROUTES - FAVORITES (customer)
+// ---------------------------------------------------------------------
+app.get(
+  "/api/favorites",
+  verifyRenter,
+  wrap(async (req, res) => {
+    const items = await col.favorites
+      .aggregate([
+        { $match: { userId: req.user._id } },
+        { $sort: { createdAt: -1 } },
+        { $lookup: { from: "equipment", localField: "equipmentId", foreignField: "_id", as: "equipment" } },
+        { $unwind: "$equipment" },
+        { $replaceRoot: { newRoot: { $mergeObjects: ["$equipment", { favoriteId: "$_id" }] } } },
+      ])
+      .toArray();
+    res.json({ items });
+  })
+);
+
+app.get(
+  "/api/favorites/ids",
+  verifyRenter,
+  wrap(async (req, res) => {
+    const list = await col.favorites.find({ userId: req.user._id }).project({ equipmentId: 1 }).toArray();
+    res.json({ ids: list.map((f) => f.equipmentId.toString()) });
+  })
+);
+
+app.post(
+  "/api/favorites/:equipmentId",
+  verifyRenter,
+  wrap(async (req, res) => {
+    const equipmentId = oid(req.params.equipmentId);
+    const item = await col.equipment.findOne({ _id: equipmentId, status: "approved" });
+    if (!item) throw new HttpError(404, "Equipment not found");
+    await col.favorites.updateOne(
+      { userId: req.user._id, equipmentId },
+      { $setOnInsert: { userId: req.user._id, equipmentId, createdAt: new Date() } },
+      { upsert: true }
+    );
+    res.status(201).json({ message: "Added to favorites" });
+  })
+);
+
+app.delete(
+  "/api/favorites/:equipmentId",
+  verifyRenter,
+  wrap(async (req, res) => {
+    await col.favorites.deleteOne({ userId: req.user._id, equipmentId: oid(req.params.equipmentId) });
+    res.json({ message: "Removed from favorites" });
+  })
+);
+
+// ---------------------------------------------------------------------
 // 17. 404 + ERROR HANDLER
 // ---------------------------------------------------------------------
 app.use((req, res) => res.status(404).json({ message: `Route not found: ${req.method} ${req.originalUrl}` }));
