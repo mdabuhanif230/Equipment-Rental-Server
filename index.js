@@ -18,11 +18,14 @@ import { MongoClient, ObjectId, ServerApiVersion } from "mongodb";
 // Only these 4 come from .env (PORT, DB_USER, DB_PASSWORD, STRIPE_SECRET_KEY)
 const { PORT = 5000, DB_USER, DB_PASSWORD, STRIPE_SECRET_KEY } = process.env;
 
-// ---- EDIT THESE VALUES (they are not secrets) ----
-const DB_CLUSTER = "cluster0.xxxxx.mongodb.net"; // from Atlas > Connect > Drivers
-const DB_NAME = "equipment_rental";
-const CLIENT_URLS = ["http://localhost:3000"]; // add your Vercel URL here after deploy
-const GOOGLE_CLIENT_ID = ""; // public Google OAuth client id (only for Google login)
+// ---- Non-secret config (overridable via .env) ----
+const DB_CLUSTER = process.env.DB_CLUSTER || "cluster0.xxxxx.mongodb.net"; // from Atlas > Connect > Drivers
+const DB_NAME = process.env.DB_NAME || "equipment_rental";
+const CLIENT_URLS = (process.env.CLIENT_URLS || "http://localhost:3000")
+  .split(",")
+  .map((u) => u.trim())
+  .filter(Boolean); // comma-separated list: add your Vercel URL after deploy
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || ""; // public Google OAuth client id (only for Google login)
 // ---------------------------------------------------
 
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET; // optional (see README)
@@ -36,7 +39,7 @@ for (const [key, value] of Object.entries({ DB_USER, DB_PASSWORD, STRIPE_SECRET_
   }
 }
 if (DB_CLUSTER.includes("xxxxx")) {
-  console.error("Please set DB_CLUSTER at the top of index.js (example: cluster0.abcde.mongodb.net)");
+  console.error("Please set DB_CLUSTER in .env (example: cluster0.abcde.mongodb.net)");
   process.exit(1);
 }
 
