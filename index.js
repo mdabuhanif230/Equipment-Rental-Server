@@ -450,6 +450,96 @@ app.patch(
 );
 
 // ---------------------------------------------------------------------
+// 10. ROUTES - EQUIPMENT (public)
+// ---------------------------------------------------------------------
+app.get(
+  "/api/equipment",
+  wrap(async (req, res) => {
+    const { page, limit, skip } = paginate(req, 9);
+    const q = req.query;
+    const filter = { status: "approved" }; // only approved items are public
+
+    if (str(q.search)) filter.name = { $regex: escapeRegex(str(q.search, 100)), $options: "i" };
+    if (str(q.location)) filter.location = { $regex: escapeRegex(str(q.location, 100)), $options: "i" };
+    if (str(q.category)) filter.category = { $regex: `^${escapeRegex(str(q.category, 60))}$`, $options: "i" };
+    if (RENTAL_TYPES.includes(str(q.rentalType))) filter.rentalType = str(q.rentalType);
+    if (q.available === "true") filter.quantity = { $gt: 0 };
+
+    const min = Number(q.minPrice);
+    const max = Number(q.maxPrice);
+    if ((q.minPrice !== undefined && q.minPrice !== "" && Number.isFinite(min)) || (q.maxPrice !== undefined && q.maxPrice !== "" && Number.isFinite(max))) {
+      filter.price = {};
+      if (q.minPrice !== "" && Number.isFinite(min)) filter.price.$gte = min;
+      if (q.maxPrice !== "" && Number.isFinite(max)) filter.price.$lte = max;
+    }
+
+    const sorts = { price_asc: { price: 1 }, price_desc: { price: -1 }, newest: { createdAt: -1 } };
+    const sort = sorts[q.sort] || sorts.newest;
+
+    const [items, total] = await Promise.all([
+      col.equipment.find(filter).sort(sort).skip(skip).limit(limit).toArray(),
+      col.equipment.countDocuments(filter),
+    ]);
+    res.json(pageResult(items, total, page, limit));
+  })
+);
+
+app.get(
+  "/api/equipment/featured",
+  wrap(async (req, res) => {
+    const items = await col.equipment.find({ status: "approved" }).sort({ createdAt: -1 }).limit(6).toArray();
+    res.json({ items });
+  })
+);
+
+app.get(
+  "/api/equipment/categories",
+  wrap(async (req, res) => {
+    const items = await col.equipment
+      .aggregate([
+        { $match: { status: "approved" } },
+        { $group: { _id: "$category", count: { $sum: 1 } } },
+        { $sort: { count: -1 } },
+        { $project: { _id: 0, category: "$_id", count: 1 } },
+      ])
+      .toArray();
+    res.json({ items });
+  })
+);
+
+app.get(
+  "/api/equipment/:id",
+  optionalAuth,
+  wrap(async (req, res) => {
+    const item = await col.equipment.findOne({ _id: oid(req.params.id) });
+    if (!item) throw new HttpError(404, "Equipment not found");
+    const canSeeHidden = req.user && (req.user.role === "admin" || item.ownerId.equals(req.user._id));
+    if (item.status !== "approved" && !canSeeHidden) throw new HttpError(404, "Equipment not found");
+    res.json({ item });
+  })
+);
+
+app.get(
+  "/api/equipment/:id/availability",
+  wrap(async (req, res) => {
+    const item = await col.equipment.findOne({ _id: oid(req.params.id), status: "approved" });
+    if (!item) throw new HttpError(404, "Equipment not found");
+    const { start, end, days } = validateDates(req.query.startDate, req.query.endDate);
+    const available = await getAvailableQuantity(item, start, end);
+    const quantity = Math.max(parseInt(req.query.quantity) || 1, 1);
+    res.json({ available, days, estimate: calculateTotal(item, days, quantity) });
+  })
+);
+
+app.get(
+  "/api/equipment/:id/reviews",
+  wrap(async (req, res) => {
+    const items = await col.reviews.find({ equipmentId: oid(req.params.id) }).sort({ createdAt: -1 }).limit(50).toArray();
+    res.json({ items });
+  })
+);
+
+// ---------------------------------------------------------------------
 // 17. 404 + ERROR HANDLER
 // ---------------------------------------------------------------------
 app.use((req, res) => res.status(404).json({ message: `Route not found: ${req.method} ${req.originalUrl}` }));
