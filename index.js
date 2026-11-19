@@ -842,6 +842,124 @@ app.patch(
 );
 
 // ---------------------------------------------------------------------
+// 14. ROUTES - REVIEWS
+// ---------------------------------------------------------------------
+app.get(
+  "/api/reviews",
+  wrap(async (req, res) => {
+    const limit = Math.min(parseInt(req.query.limit) || 6, 20);
+    const items = await col.reviews.find().sort({ createdAt: -1 }).limit(limit).toArray();
+    res.json({ items });
+  })
+);
+
+app.post(
+  "/api/reviews",
+  verifyRenter,
+  wrap(async (req, res) => {
+    const rating = Number(req.body.rating);
+    const comment = str(req.body.comment, 1000);
+    if (!Number.isInteger(rating) || rating < 1 || rating > 5) throw new HttpError(400, "Rating must be between 1 and 5");
+    if (!comment) throw new HttpError(400, "Comment is required");
+    const booking = await col.bookings.findOne({ _id: oid(req.body.bookingId), customerId: req.user._id, status: "completed" });
+    if (!booking) throw new HttpError(400, "You can only review your completed rentals");
+    if (await col.reviews.findOne({ bookingId: booking._id })) throw new HttpError(409, "You already reviewed this rental");
+    const review = {
+      bookingId: booking._id,
+      equipmentId: booking.equipmentId,
+      equipmentName: booking.equipmentName,
+      userId: req.user._id,
+      userName: req.user.name,
+      userPhoto: req.user.photoURL || "",
+      rating,
+      comment,
+      createdAt: new Date(),
+    };
+    review._id = (await col.reviews.insertOne(review)).insertedId;
+    res.status(201).json({ item: review });
+  })
+);
+
+// ---------------------------------------------------------------------
+// 15. ROUTES - ADMIN
+// ---------------------------------------------------------------------
+app.get(
+  "/api/admin/users",
+  verifyAdmin,
+  wrap(async (req, res) => {
+    const { page, limit, skip } = paginate(req, 10);
+    const filter = {};
+    if (ROLES.includes(req.query.role)) filter.role = req.query.role;
+    if (str(req.query.search)) {
+      const rx = { $regex: escapeRegex(str(req.query.search, 80)), $options: "i" };
+      filter.$or = [{ name: rx }, { email: rx }];
+    }
+    const [items, total] = await Promise.all([
+      col.users.find(filter, { projection: { passwordHash: 0 } }).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+      col.users.countDocuments(filter),
+    ]);
+    res.json(pageResult(items, total, page, limit));
+  })
+);
+
+app.patch(
+  "/api/admin/users/:id/role",
+  verifyAdmin,
+  wrap(async (req, res) => {
+    const _id = oid(req.params.id);
+    const role = req.body.role;
+    if (!ROLES.includes(role)) throw new HttpError(400, "Role must be customer, owner or admin");
+    if (_id.equals(req.user._id)) throw new HttpError(400, "You cannot change your own role");
+    const result = await col.users.findOneAndUpdate({ _id }, { $set: { role } }, { returnDocument: "after", projection: { passwordHash: 0 } });
+    if (!result) throw new HttpError(404, "User not found");
+    res.json({ user: result });
+  })
+);
+
+app.get(
+  "/api/admin/equipment",
+  verifyAdmin,
+  wrap(async (req, res) => {
+    const { page, limit, skip } = paginate(req, 10);
+    const filter = {};
+    if (EQUIPMENT_STATUSES.includes(req.query.status)) filter.status = req.query.status;
+    const [items, total] = await Promise.all([
+      col.equipment.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+      col.equipment.countDocuments(filter),
+    ]);
+    res.json(pageResult(items, total, page, limit));
+  })
+);
+
+app.patch(
+  "/api/admin/equipment/:id/status",
+  verifyAdmin,
+  wrap(async (req, res) => {
+    if (!EQUIPMENT_STATUSES.includes(req.body.status)) throw new HttpError(400, "Status must be pending, approved or rejected");
+    const result = await col.equipment.findOneAndUpdate(
+      { _id: oid(req.params.id) },
+      { $set: { status: req.body.status, updatedAt: new Date() } },
+      { returnDocument: "after" }
+    );
+    if (!result) throw new HttpError(404, "Equipment not found");
+    res.json({ item: result });
+  })
+);
+
+app.get(
+  "/api/admin/bookings",
+  verifyAdmin,
+  wrap(async (req, res) => {
+    const { page, limit, skip } = paginate(req, 10);
+    const [items, total] = await Promise.all([
+      col.bookings.find().sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+      col.bookings.countDocuments(),
+    ]);
+    res.json(pageResult(items, total, page, limit));
+  })
+);
+
+// ---------------------------------------------------------------------
 // 17. 404 + ERROR HANDLER
 // ---------------------------------------------------------------------
 app.use((req, res) => res.status(404).json({ message: `Route not found: ${req.method} ${req.originalUrl}` }));
