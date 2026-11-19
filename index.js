@@ -353,6 +353,103 @@ app.use(express.json({ limit: "10mb" }));
 app.get("/", (req, res) => res.json({ status: "ok", message: "Equipment Rental API is running" }));
 
 // ---------------------------------------------------------------------
+// 8. ROUTES - AUTH
+// ---------------------------------------------------------------------
+// Register: role is ALWAYS "customer". Role changes only through admin API.
+app.post(
+  "/api/auth/register",
+  wrap(async (req, res) => {
+    const name = str(req.body.name, 80);
+    const email = str(req.body.email, 120).toLowerCase();
+    const photoURL = str(req.body.photoURL, 500);
+    if (!name) throw new HttpError(400, "Name is required");
+    if (!isEmail(email)) throw new HttpError(400, "Valid email is required");
+    const passError = validatePassword(req.body.password);
+    if (passError) throw new HttpError(400, passError);
+    if (await col.users.findOne({ email })) throw new HttpError(409, "An account with this email already exists");
+
+    const user = {
+      name,
+      email,
+      passwordHash: await bcrypt.hash(req.body.password, 10),
+      role: "customer",
+      photoURL,
+      phone: "",
+      provider: "password",
+      createdAt: new Date(),
+    };
+    const result = await col.users.insertOne(user);
+    user._id = result.insertedId;
+    res.status(201).json({ token: signToken(user), user: publicUser(user) });
+  })
+);
+
+app.post(
+  "/api/auth/login",
+  wrap(async (req, res) => {
+    const email = str(req.body.email, 120).toLowerCase();
+    const password = typeof req.body.password === "string" ? req.body.password : "";
+    const user = await col.users.findOne({ email });
+    if (!user || !user.passwordHash || !(await bcrypt.compare(password, user.passwordHash))) {
+      throw new HttpError(401, "Invalid email or password");
+    }
+    res.json({ token: signToken(user), user: publicUser(user) });
+  })
+);
+
+// Google login: frontend sends the Google ID token (credential)
+app.post(
+  "/api/auth/google",
+  wrap(async (req, res) => {
+    if (!GOOGLE_CLIENT_ID) throw new HttpError(500, "Google login is not configured");
+    const idToken = str(req.body.idToken, 4000);
+    if (!idToken) throw new HttpError(400, "idToken is required");
+
+    const verify = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`);
+    if (!verify.ok) throw new HttpError(401, "Invalid Google token");
+    const g = await verify.json();
+    if (g.aud !== GOOGLE_CLIENT_ID || g.email_verified !== "true") throw new HttpError(401, "Google token rejected");
+
+    const email = g.email.toLowerCase();
+    let user = await col.users.findOne({ email });
+    if (!user) {
+      user = {
+        name: g.name || email.split("@")[0],
+        email,
+        role: "customer", // Google signup is always customer
+        photoURL: g.picture || "",
+        phone: "",
+        provider: "google",
+        createdAt: new Date(),
+      };
+      user._id = (await col.users.insertOne(user)).insertedId;
+    }
+    res.json({ token: signToken(user), user: publicUser(user) });
+  })
+);
+
+// Persistent login: frontend calls this on reload with the saved token
+app.get("/api/auth/me", verifyToken, (req, res) => res.json({ user: publicUser(req.user) }));
+
+app.patch(
+  "/api/users/me",
+  verifyToken,
+  wrap(async (req, res) => {
+    const update = {};
+    if (req.body.name !== undefined) {
+      update.name = str(req.body.name, 80);
+      if (!update.name) throw new HttpError(400, "Name cannot be empty");
+    }
+    if (req.body.photoURL !== undefined) update.photoURL = str(req.body.photoURL, 500);
+    if (req.body.phone !== undefined) update.phone = str(req.body.phone, 30);
+    if (!Object.keys(update).length) throw new HttpError(400, "Nothing to update");
+    await col.users.updateOne({ _id: req.user._id }, { $set: update }); // role is never updatable here
+    const user = await col.users.findOne({ _id: req.user._id });
+    res.json({ user: publicUser(user) });
+  })
+);
+
+// ---------------------------------------------------------------------
 // 17. 404 + ERROR HANDLER
 // ---------------------------------------------------------------------
 app.use((req, res) => res.status(404).json({ message: `Route not found: ${req.method} ${req.originalUrl}` }));
