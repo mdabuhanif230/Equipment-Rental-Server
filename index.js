@@ -670,6 +670,178 @@ app.delete(
 );
 
 // ---------------------------------------------------------------------
+// 13. ROUTES - BOOKINGS
+// ---------------------------------------------------------------------
+app.post(
+  "/api/bookings",
+  verifyRenter,
+  wrap(async (req, res) => {
+    const b = req.body;
+    const equipment = await col.equipment.findOne({ _id: oid(b.equipmentId), status: "approved" });
+    if (!equipment) throw new HttpError(404, "Equipment not found");
+    if (equipment.ownerId.equals(req.user._id)) throw new HttpError(400, "You cannot book your own equipment");
+
+    const { start, end, days } = validateDates(b.startDate, b.endDate);
+    const quantity = Number(b.quantity);
+    if (!Number.isInteger(quantity) || quantity < 1) throw new HttpError(400, "Quantity must be at least 1");
+
+    const phone = str(b.phone, 30);
+    const address = str(b.address, 300);
+    if (!/^[0-9+\-\s()]{7,20}$/.test(phone)) throw new HttpError(400, "Valid contact number is required");
+    if (!address) throw new HttpError(400, "Delivery address is required");
+
+    const available = await getAvailableQuantity(equipment, start, end);
+    if (quantity > available) {
+      throw new HttpError(409, available > 0 ? `Only ${available} unit(s) available for these dates` : "Not available for these dates");
+    }
+
+    const { units, total } = calculateTotal(equipment, days, quantity);
+    const booking = {
+      equipmentId: equipment._id,
+      equipmentName: equipment.name,
+      equipmentImage: equipment.image,
+      ownerId: equipment.ownerId,
+      customerId: req.user._id,
+      customerName: req.user.name,
+      customerEmail: req.user.email,
+      startDate: start,
+      endDate: end,
+      days,
+      rentalType: equipment.rentalType,
+      rentalUnits: units,
+      pricePerUnit: equipment.price,
+      quantity,
+      totalAmount: total,
+      phone,
+      address,
+      notes: str(b.notes, 500),
+      status: "pending",
+      paymentStatus: "unpaid",
+      holdUntil: new Date(Date.now() + HOLD_MS),
+      createdAt: new Date(),
+    };
+    booking._id = (await col.bookings.insertOne(booking)).insertedId;
+
+    let session;
+    try {
+      session = await createCheckoutSession(booking, req.user.email, clientBase(req));
+    } catch (err) {
+      await col.bookings.deleteOne({ _id: booking._id });
+      throw new HttpError(502, "Could not start payment. Please try again.");
+    }
+    res.status(201).json({ bookingId: booking._id, checkoutUrl: session.url });
+  })
+);
+
+app.get(
+  "/api/bookings/my",
+  verifyRenter,
+  wrap(async (req, res) => {
+    const { page, limit, skip } = paginate(req);
+    const filter = { customerId: req.user._id };
+    const [items, total] = await Promise.all([
+      col.bookings.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+      col.bookings.countDocuments(filter),
+    ]);
+    res.json(pageResult(items, total, page, limit));
+  })
+);
+
+app.get(
+  "/api/bookings/owner",
+  verifyOwner,
+  wrap(async (req, res) => {
+    const { page, limit, skip } = paginate(req);
+    const filter = { ownerId: req.user._id };
+    const [items, total] = await Promise.all([
+      col.bookings.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+      col.bookings.countDocuments(filter),
+    ]);
+    res.json(pageResult(items, total, page, limit));
+  })
+);
+
+// Single booking (also used by the payment success page to confirm status)
+app.get(
+  "/api/bookings/:id",
+  verifyToken,
+  wrap(async (req, res) => {
+    const booking = await col.bookings.findOne({ _id: oid(req.params.id) });
+    const u = req.user;
+    const allowed =
+      booking && (u.role === "admin" || booking.customerId.equals(u._id) || booking.ownerId.equals(u._id));
+    if (!allowed) throw new HttpError(404, "Booking not found");
+    res.json({ item: booking });
+  })
+);
+
+// Retry payment for a pending booking
+app.post(
+  "/api/bookings/:id/pay",
+  verifyRenter,
+  wrap(async (req, res) => {
+    const booking = await col.bookings.findOne({ _id: oid(req.params.id), customerId: req.user._id });
+    if (!booking) throw new HttpError(404, "Booking not found");
+    if (booking.status !== "pending" || booking.paymentStatus !== "unpaid") throw new HttpError(400, "This booking cannot be paid");
+    const equipment = await col.equipment.findOne({ _id: booking.equipmentId, status: "approved" });
+    if (!equipment) throw new HttpError(404, "Equipment is no longer available");
+    const available = await getAvailableQuantity(equipment, booking.startDate, booking.endDate, booking._id);
+    if (booking.quantity > available) throw new HttpError(409, "Equipment is no longer available for these dates");
+    const session = await createCheckoutSession(booking, req.user.email, clientBase(req));
+    res.json({ checkoutUrl: session.url });
+  })
+);
+
+// Server-side payment check: asks Stripe directly (never trusts the frontend).
+// Call this from the payment success page. Works even without a webhook.
+app.post(
+  "/api/bookings/:id/verify",
+  verifyRenter,
+  wrap(async (req, res) => {
+    const booking = await col.bookings.findOne({ _id: oid(req.params.id), customerId: req.user._id });
+    if (!booking) throw new HttpError(404, "Booking not found");
+    if (booking.paymentStatus !== "paid" && booking.stripeSessionId) {
+      const session = await stripe.checkout.sessions.retrieve(booking.stripeSessionId);
+      if (session.payment_status === "paid") await markBookingPaid(session);
+    }
+    const fresh = await col.bookings.findOne({ _id: booking._id });
+    res.json({ item: fresh });
+  })
+);
+
+// Customer cancels an unpaid booking
+app.patch(
+  "/api/bookings/:id/cancel",
+  verifyRenter,
+  wrap(async (req, res) => {
+    const booking = await col.bookings.findOneAndUpdate(
+      { _id: oid(req.params.id), customerId: req.user._id, status: "pending", paymentStatus: "unpaid" },
+      { $set: { status: "cancelled" } },
+      { returnDocument: "before" }
+    );
+    if (!booking) throw new HttpError(400, "Only unpaid pending bookings can be cancelled");
+    if (booking.stripeSessionId) await stripe.checkout.sessions.expire(booking.stripeSessionId).catch(() => {});
+    res.json({ message: "Booking cancelled" });
+  })
+);
+
+// Owner marks a paid booking as completed (equipment returned)
+app.patch(
+  "/api/bookings/:id/status",
+  verifyOwner,
+  wrap(async (req, res) => {
+    if (req.body.status !== "completed") throw new HttpError(400, "Status can only be changed to 'completed'");
+    const result = await col.bookings.findOneAndUpdate(
+      { _id: oid(req.params.id), ownerId: req.user._id, status: "confirmed", paymentStatus: "paid" },
+      { $set: { status: "completed", completedAt: new Date() } },
+      { returnDocument: "after" }
+    );
+    if (!result) throw new HttpError(400, "Only your confirmed (paid) bookings can be completed");
+    res.json({ item: result });
+  })
+);
+
+// ---------------------------------------------------------------------
 // 17. 404 + ERROR HANDLER
 // ---------------------------------------------------------------------
 app.use((req, res) => res.status(404).json({ message: `Route not found: ${req.method} ${req.originalUrl}` }));
