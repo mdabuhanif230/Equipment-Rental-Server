@@ -18,12 +18,18 @@ and role-specific dashboards.
 - Owner listings, admin approvals, bookings, and availability checks.
 - Stripe Checkout, verified payment records, and booking status updates.
 - Admin and owner dashboard analytics.
+- Admin user management: role changes plus suspend/restore (suspended accounts are rejected by `verifyToken`).
+- `node-cron` job that expires unpaid holds and completes rentals after their end date.
+- Optional Resend email notifications to renters and owners when a rental is completed.
+- Idempotent `npm run seed` script for demo equipment and homepage reviews.
 
 ## Run
 ```bash
 npm install
 # copy .env.example to .env and configure it
 npm run dev
+# optional: populate an empty database with demo equipment and reviews
+npm run seed
 ```
 
 ## Setup
@@ -53,7 +59,7 @@ analytics, error handling, and startup/database indexes.
 ## Packages
 
 Runtime: `express`, `cors`, `helmet`, `dotenv`, `mongodb`, `better-auth`,
-`@better-auth/mongo-adapter`, `bcryptjs`, `jose`, `jsonwebtoken`, and `stripe`.
+`@better-auth/mongo-adapter`, `bcryptjs`, `jose`, `jsonwebtoken`, `node-cron`, and `stripe`.
 Development: `nodemon`.
 
 ## Stripe webhook (optional, recommended for production)
@@ -70,7 +76,7 @@ Copy the `whsec_...` value into `STRIPE_WEBHOOK_SECRET`. The payment success pag
   `/api/equipment/:id`, `/api/equipment/:id/availability`
 - Customer: `/api/favorites`, `/api/bookings/my`, `/api/stats/customer`
 - Owner: `/api/owner/equipment`, `/api/bookings/owner`, `/api/stats/owner`
-- Admin: `/api/admin/users`, `/api/admin/equipment`, `/api/admin/bookings`,
+- Admin: `/api/admin/users` (role + suspend/restore), `/api/admin/equipment`, `/api/admin/bookings`,
   `/api/admin/bookings/:id/status`, `/api/stats/admin`
 - Payments: `/api/bookings` (Stripe checkout), `/api/payments/webhook`
 - Reviews: `/api/reviews`
