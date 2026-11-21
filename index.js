@@ -12,6 +12,7 @@ import { APIError } from 'better-auth/api';
 import { toNodeHandler } from 'better-auth/node';
 import { jwt as betterAuthJwt, oneTap } from 'better-auth/plugins';
 import { createRemoteJWKSet, jwtVerify } from 'jose';
+import cron from 'node-cron';
 
 const app = express();
 app.disable('etag');
@@ -76,7 +77,7 @@ const asId = (id) => String(id);
 const publicUser = (user) => ({
   _id: asId(user._id || user.id), name: user.name, email: user.email, role: user.role,
   photoURL: user.photoURL || user.image || '', phone: user.phone || '', address: user.address || '',
-  createdAt: user.createdAt, ...(user.provider ? { provider: user.provider } : {}),
+  createdAt: user.createdAt, banned: !!user.banned, ...(user.provider ? { provider: user.provider } : {}),
 });
 const publicEquipment = (item) => ({ ...item, _id: asId(item._id), ownerId: asId(item.ownerId) });
 const publicBooking = (item) => ({ ...item, _id: asId(item._id), equipmentId: asId(item.equipmentId), ownerId: asId(item.ownerId), customerId: asId(item.customerId) });
@@ -98,6 +99,34 @@ const rentalUnits = (type, days) => type === 'Weekly' ? Math.ceil(days / 7) : ty
 const now = () => new Date();
 const clientUrl = () => (process.env.NEXT_PUBLIC_SITE_URL || clientOrigins[0] || 'http://localhost:3000').replace(/\/$/, '');
 
+// Optional email notifications — enabled when RESEND_API_KEY is configured.
+const sendEmail = async (to, subject, html) => {
+  const key = process.env.RESEND_API_KEY;
+  if (!key || !to) return;
+  try {
+    await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from: process.env.EMAIL_FROM || 'RentGear <onboarding@resend.dev>',
+        to, subject, html,
+      }),
+    });
+  } catch (error) {
+    console.error('Could not send notification email:', error.message);
+  }
+};
+const notifyBookingCompleted = async (booking) => {
+  const ids = [booking.customerId, booking.ownerId].map(idOf).filter(Boolean);
+  if (!ids.length) return;
+  const people = await users.find({ _id: { $in: ids } }).project({ name: 1, email: 1 }).toArray();
+  await Promise.all(people.map((person) => sendEmail(
+    person.email,
+    `Your rental of ${booking.equipmentName} is complete`,
+    `<p>Hi ${person.name},</p><p>The rental of <strong>${booking.equipmentName}</strong> (${booking.startDate} → ${booking.endDate}) is now marked as completed.</p><p>Total: ${booking.totalAmount} ${booking.currency || ''}</p><p>— RentGear</p>`,
+  )));
+};
+
 const verifyToken = route(async (req, _res, next) => {
   const value = req.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
   if (!value) fail(401, 'Please sign in to continue.');
@@ -117,6 +146,7 @@ const verifyToken = route(async (req, _res, next) => {
   const userId = idOf(payload.sub);
   const user = userId ? await users.findOne({ _id: userId }) : null;
   if (!user) fail(401, 'Your account could not be found. Please sign in again.');
+  if (user.banned) fail(403, 'This account has been suspended by an administrator.');
   req.user = user;
   next();
 });
@@ -268,6 +298,19 @@ app.patch('/api/users/me', verifyToken, route(async (req, res) => {
   for (const key of ['name', 'photoURL', 'phone', 'address']) {
     if (typeof req.body[key] === 'string') update[key] = req.body[key].trim();
   }
+  if (typeof req.body.email === 'string') {
+    const email = req.body.email.trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) fail(400, 'Enter a valid email address.');
+    if (email !== String(req.user.email || '').toLowerCase()) {
+      if (await users.findOne({ email, _id: { $ne: req.user._id } })) fail(409, 'That email address is already registered.');
+      update.email = email;
+      // Keep Better Auth's credential lookup in sync (accountId is the email).
+      await mongo.db(dbName).collection('account').updateMany(
+        { userId: req.user._id, providerId: 'credential' },
+        { $set: { accountId: email } },
+      );
+    }
+  }
   if (update.name !== undefined && (update.name.length < 2 || update.name.length > 80)) fail(400, 'Name must be between 2 and 80 characters.');
   if (update.photoURL && !/^https?:\/\//i.test(update.photoURL)) fail(400, 'Photo URL must use http or https.');
   update.updatedAt = now();
@@ -402,7 +445,23 @@ app.get('/api/bookings/owner', verifyToken, verifyOwner, route(async (req, res) 
   res.json(await paginated(bookings, { ownerId: req.user._id }, req.query, { createdAt: -1 }, publicBooking));
 }));
 app.get('/api/admin/bookings', verifyToken, verifyAdmin, route(async (req, res) => {
-  res.json(await paginated(bookings, {}, req.query, { createdAt: -1 }, publicBooking));
+  const result = await paginated(bookings, {}, req.query, { createdAt: -1 }, publicBooking);
+  // Older bookings only stored ownerId — fill owner details so the admin table
+  // can show full owner information without a second round trip.
+  const missing = result.items.some((b) => !b.ownerName);
+  if (missing) {
+    const ids = [...new Set(result.items.map((b) => idOf(b.ownerId)).filter(Boolean))];
+    const owners = ids.length
+      ? await users.find({ _id: { $in: ids } }).project({ name: 1, email: 1 }).toArray()
+      : [];
+    const byId = new Map(owners.map((o) => [String(o._id), o]));
+    for (const b of result.items) {
+      if (b.ownerName) continue;
+      const owner = byId.get(String(b.ownerId));
+      if (owner) { b.ownerName = owner.name; b.ownerEmail = owner.email; }
+    }
+  }
+  res.json(result);
 }));
 app.patch('/api/admin/bookings/:id/status', verifyToken, verifyAdmin, route(async (req, res) => {
   const booking = await getBooking(req.params.id);
@@ -438,6 +497,7 @@ app.patch('/api/admin/bookings/:id/status', verifyToken, verifyAdmin, route(asyn
       { returnDocument: 'after' },
     );
     if (!updated) fail(409, 'This booking has already changed and cannot be completed.');
+    void notifyBookingCompleted(updated);
     res.json({ item: publicBooking(updated) });
     return;
   }
@@ -460,6 +520,7 @@ app.post('/api/bookings', verifyToken, verifyRenter, route(async (req, res) => {
   const units = rentalUnits(item.rentalType, days);
   const booking = {
     equipmentId: item._id, equipmentName: item.name, equipmentImage: item.image, ownerId: item.ownerId,
+    ownerName: item.ownerName || '', ownerEmail: item.ownerEmail || '',
     customerId: req.user._id, customerName: req.user.name, customerEmail: req.user.email,
     startDate, endDate, days, rentalType: item.rentalType, rentalUnits: units, pricePerUnit: item.price,
     quantity, totalAmount: Math.round(item.price * units * quantity * 100) / 100,
@@ -525,6 +586,7 @@ app.patch('/api/bookings/:id/status', verifyToken, verifyOwner, route(async (req
   if (String(booking.ownerId) !== String(req.user._id)) fail(404, 'Booking was not found.');
   if (booking.paymentStatus !== 'paid' || booking.status !== 'confirmed') fail(409, 'Only paid, confirmed rentals can be completed.');
   const updated = await bookings.findOneAndUpdate({ _id: booking._id, status: 'confirmed' }, { $set: { status: 'completed', completedAt: now() } }, { returnDocument: 'after' });
+  void notifyBookingCompleted(updated);
   res.json({ item: publicBooking(updated) });
 }));
 
@@ -545,6 +607,19 @@ app.patch('/api/admin/users/:id/role', verifyToken, verifyAdmin, route(async (re
   const user = await users.findOneAndUpdate({ _id: objectId }, { $set: { role: req.body.role, updatedAt: now() } }, { returnDocument: 'after' });
   if (!user) fail(404, 'User was not found.');
   res.json({ user: publicUser(user) });
+}));
+app.patch('/api/admin/users/:id/ban', verifyToken, verifyAdmin, route(async (req, res) => {
+  if (typeof req.body.banned !== 'boolean') fail(400, 'Choose a valid account state.');
+  const objectId = idOf(req.params.id); if (!objectId) fail(400, 'Invalid user id.');
+  if (String(objectId) === String(req.user._id)) fail(400, 'You cannot suspend your own account.');
+  const user = await users.findOne({ _id: objectId }); if (!user) fail(404, 'User was not found.');
+  if (user.role === 'admin' && req.body.banned) fail(400, 'Admin accounts cannot be suspended.');
+  const updated = await users.findOneAndUpdate(
+    { _id: objectId },
+    { $set: { banned: req.body.banned, updatedAt: now() } },
+    { returnDocument: 'after' },
+  );
+  res.json({ user: publicUser(updated) });
 }));
 app.get('/api/admin/equipment', verifyToken, verifyAdmin, route(async (req, res) => {
   const filter = {};
@@ -760,9 +835,12 @@ async function start() {
     reviews.createIndex({ bookingId: 1 }, { unique: true, sparse: true }), reviews.createIndex({ equipmentId: 1, createdAt: -1 }),
   ]);
   await migrateLegacyPasswordAccounts(db.collection('account'));
-  const expiryTimer = setInterval(async () => {
+  const refreshRentalStatuses = async () => {
     try {
       const today = new Date().toISOString().slice(0, 10);
+      const justCompleted = await bookings
+        .find({ status: 'confirmed', paymentStatus: 'paid', endDate: { $lt: today } })
+        .toArray();
       await Promise.all([
         bookings.updateMany(
           { status: 'pending', paymentStatus: 'unpaid', holdUntil: { $lte: now() } },
@@ -773,11 +851,14 @@ async function start() {
           { $set: { status: 'completed', completedAt: now() } },
         ),
       ]);
+      for (const booking of justCompleted) void notifyBookingCompleted(booking);
     } catch (error) {
       console.error('Could not refresh expired rental statuses:', error.message);
     }
-  }, 60_000);
-  expiryTimer.unref();
+  };
+  // node-cron job: expires unpaid holds and completes rentals whose end date has passed.
+  cron.schedule('*/1 * * * *', refreshRentalStatuses);
+  await refreshRentalStatuses();
   app.listen(port, () => {
     console.log(`Server is running on port number ${port}`);
     console.log('MongoDB connection successful');
