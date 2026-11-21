@@ -462,10 +462,21 @@ app.get('/api/admin/bookings', verifyToken, verifyAdmin, route(async (req, res) 
       ? await users.find({ _id: { $in: ids } }).project({ name: 1, email: 1 }).toArray()
       : [];
     const byId = new Map(owners.map((o) => [String(o._id), o]));
+    // If the owner account was deleted, fall back to the owner details stored
+    // on the equipment document so the admin table never shows a blank owner.
+    const gearIds = [...new Set(result.items
+      .filter((b) => !b.ownerName && b.equipmentId)
+      .map((b) => idOf(b.equipmentId)).filter(Boolean))];
+    const gear = gearIds.length
+      ? await equipment.find({ _id: { $in: gearIds } }).project({ ownerName: 1, ownerEmail: 1 }).toArray()
+      : [];
+    const gearById = new Map(gear.map((g) => [String(g._id), g]));
     for (const b of result.items) {
       if (b.ownerName) continue;
       const owner = byId.get(String(b.ownerId));
-      if (owner) { b.ownerName = owner.name; b.ownerEmail = owner.email; }
+      if (owner) { b.ownerName = owner.name; b.ownerEmail = owner.email; continue; }
+      const item = gearById.get(String(b.equipmentId));
+      if (item) { b.ownerName = item.ownerName || ''; b.ownerEmail = item.ownerEmail || ''; }
     }
   }
   res.json(result);
