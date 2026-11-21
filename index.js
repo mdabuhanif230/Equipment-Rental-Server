@@ -1,1069 +1,790 @@
-// =====================================================================
-// Equipment Rental Platform - Backend (single file)
-// Express + MongoDB (native driver) + JWT + Stripe + ImgBB
-// =====================================================================
-import "dotenv/config";
-import crypto from "node:crypto";
-import express from "express";
-import cors from "cors";
-import helmet from "helmet";
-import jwt from "jsonwebtoken";
-import bcrypt from "bcryptjs";
-import Stripe from "stripe";
-import { MongoClient, ObjectId, ServerApiVersion } from "mongodb";
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import { MongoClient, ObjectId } from 'mongodb';
+import Stripe from 'stripe';
+import { mongodbAdapter } from '@better-auth/mongo-adapter';
+import { betterAuth } from 'better-auth';
+import { APIError } from 'better-auth/api';
+import { toNodeHandler } from 'better-auth/node';
+import { jwt as betterAuthJwt, oneTap } from 'better-auth/plugins';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
 
-// ---------------------------------------------------------------------
-// 1. ENV + CONSTANTS
-// ---------------------------------------------------------------------
-// Only these 4 come from .env (PORT, DB_USER, DB_PASSWORD, STRIPE_SECRET_KEY)
-const { PORT = 5000, DB_USER, DB_PASSWORD, STRIPE_SECRET_KEY } = process.env;
-
-// ---- Non-secret config (overridable via .env) ----
-const DB_CLUSTER = process.env.DB_CLUSTER || "cluster0.xxxxx.mongodb.net"; // from Atlas > Connect > Drivers
-const DB_NAME = process.env.DB_NAME || "equipment_rental";
-const CLIENT_URLS = (process.env.CLIENT_URLS || "http://localhost:3000")
-  .split(",")
-  .map((u) => u.trim())
-  .filter(Boolean); // comma-separated list: add your Vercel URL after deploy
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || ""; // public Google OAuth client id (only for Google login)
-// ---------------------------------------------------
-
-const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET; // optional (see README)
-// JWT secret is derived from your private env values, so no extra variable is needed
-const JWT_SECRET = crypto.createHash("sha256").update(`jwt|${DB_PASSWORD}|${STRIPE_SECRET_KEY}`).digest("hex");
-
-for (const [key, value] of Object.entries({ DB_USER, DB_PASSWORD, STRIPE_SECRET_KEY })) {
-  if (!value) {
-    console.error(`Missing required env variable: ${key}`);
-    process.exit(1);
-  }
-}
-if (DB_CLUSTER.includes("xxxxx")) {
-  console.error("Please set DB_CLUSTER in .env (example: cluster0.abcde.mongodb.net)");
-  process.exit(1);
-}
-
-const stripe = new Stripe(STRIPE_SECRET_KEY);
-const DAY_MS = 24 * 60 * 60 * 1000;
-const HOLD_MS = 35 * 60 * 1000; // a pending booking holds stock for 35 minutes
-const MAX_RENTAL_DAYS = 365;
-const RENTAL_TYPES = ["Daily", "Weekly", "Monthly"];
-const ROLES = ["customer", "owner", "admin"];
-const EQUIPMENT_STATUSES = ["pending", "approved", "rejected"];
-
-// ---------------------------------------------------------------------
-// 2. DATABASE
-// ---------------------------------------------------------------------
-const uri = `mongodb+srv://${encodeURIComponent(DB_USER)}:${encodeURIComponent(DB_PASSWORD)}@${DB_CLUSTER}/?retryWrites=true&w=majority&appName=EquipmentRental`;
-const client = new MongoClient(uri, {
-  serverApi: { version: ServerApiVersion.v1, strict: true, deprecationErrors: true },
-});
-const col = {}; // collections are filled after connecting
-
-async function connectDB() {
-  await client.connect();
-  const db = client.db(DB_NAME);
-  col.users = db.collection("users");
-  col.equipment = db.collection("equipment");
-  col.bookings = db.collection("bookings");
-  col.favorites = db.collection("favorites");
-  col.payments = db.collection("payments");
-  col.reviews = db.collection("reviews");
-
-  await Promise.all([
-    col.users.createIndex({ email: 1 }, { unique: true }),
-    col.equipment.createIndex({ status: 1, category: 1, createdAt: -1 }),
-    col.equipment.createIndex({ ownerId: 1 }),
-    col.bookings.createIndex({ equipmentId: 1, startDate: 1, endDate: 1 }),
-    col.bookings.createIndex({ customerId: 1 }),
-    col.bookings.createIndex({ ownerId: 1 }),
-    col.favorites.createIndex({ userId: 1, equipmentId: 1 }, { unique: true }),
-    col.payments.createIndex({ sessionId: 1 }, { unique: true }),
-    col.reviews.createIndex({ bookingId: 1 }, { unique: true }),
-    col.reviews.createIndex({ equipmentId: 1, createdAt: -1 }),
-  ]);
-  console.log("MongoDB connected");
-}
-
-// ---------------------------------------------------------------------
-// 3. HELPERS
-// ---------------------------------------------------------------------
-class HttpError extends Error {
-  constructor(status, message) {
-    super(message);
-    this.status = status;
-  }
-}
-const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
-
-const oid = (id) => {
-  if (typeof id !== "string" || !/^[a-f\d]{24}$/i.test(id)) throw new HttpError(400, "Invalid id");
-  return new ObjectId(id);
-};
-const str = (v, max = 500) => (typeof v === "string" ? v.trim().slice(0, max) : "");
-const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-const money = (n) => Math.round(n * 100) / 100;
-
-const parseDate = (v) => {
-  if (typeof v !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(v)) return null;
-  const d = new Date(`${v}T00:00:00.000Z`);
-  return Number.isNaN(d.getTime()) ? null : d;
-};
-const todayUTC = () => {
-  const n = new Date();
-  return new Date(Date.UTC(n.getUTCFullYear(), n.getUTCMonth(), n.getUTCDate()));
-};
-
-const paginate = (req, defaultLimit = 10) => {
-  const page = Math.max(parseInt(req.query.page) || 1, 1);
-  const limit = Math.min(Math.max(parseInt(req.query.limit) || defaultLimit, 1), 50);
-  return { page, limit, skip: (page - 1) * limit };
-};
-const pageResult = (items, total, page, limit) => ({ items, total, page, pages: Math.ceil(total / limit) || 1 });
-
-const publicUser = (u) => ({
-  _id: u._id,
-  name: u.name,
-  email: u.email,
-  role: u.role,
-  photoURL: u.photoURL || "",
-  phone: u.phone || "",
-  address: u.address || "",
-  createdAt: u.createdAt,
-});
-const signToken = (user) => jwt.sign({ id: user._id.toString() }, JWT_SECRET, { expiresIn: "7d" });
-
-const validatePassword = (p) => {
-  if (typeof p !== "string" || p.length < 6) return "Password must be at least 6 characters";
-  if (!/[A-Z]/.test(p)) return "Password must contain an uppercase letter";
-  if (!/[a-z]/.test(p)) return "Password must contain a lowercase letter";
-  return null;
-};
-const isEmail = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
-
-// ---------------------------------------------------------------------
-// 4. MIDDLEWARES
-// ---------------------------------------------------------------------
-async function loadUserFromToken(req) {
-  const header = req.headers.authorization || "";
-  if (!header.startsWith("Bearer ")) return null;
-  try {
-    const { id } = jwt.verify(header.slice(7), JWT_SECRET);
-    return await col.users.findOne({ _id: new ObjectId(id) });
-  } catch {
-    return null;
-  }
-}
-
-const verifyToken = wrap(async (req, res, next) => {
-  const user = await loadUserFromToken(req);
-  if (!user) throw new HttpError(401, "Unauthorized: please login again");
-  req.user = user; // role always comes from the database, never from the client
-  next();
-});
-const optionalAuth = wrap(async (req, res, next) => {
-  req.user = await loadUserFromToken(req);
-  next();
-});
-const requireRole = (role) => (req, res, next) =>
-  req.user?.role === role ? next() : next(new HttpError(403, `Forbidden: ${role} access only`));
-
-const verifyRenter = [verifyToken, requireRole("customer")];
-const verifyOwner = [verifyToken, requireRole("owner")];
-const verifyAdmin = [verifyToken, requireRole("admin")];
-
-// ---------------------------------------------------------------------
-// 5. BUSINESS HELPERS (equipment validation, availability, pricing)
-// ---------------------------------------------------------------------
-function validateEquipment(b) {
-  const data = {
-    name: str(b.name, 120),
-    description: str(b.description, 3000),
-    category: str(b.category, 60),
-    location: str(b.location, 120),
-    price: Number(b.price),
-    rentalType: str(b.rentalType, 10),
-    quantity: Number(b.quantity),
-    condition: str(b.condition, 40),
-    brand: str(b.brand, 60),
-    model: str(b.model, 60),
-    image: str(b.image, 500),
-    rentalTerms: str(b.rentalTerms, 2000),
-  };
-  for (const f of ["name", "description", "category", "location", "condition", "brand", "model", "image", "rentalTerms"]) {
-    if (!data[f]) throw new HttpError(400, `${f} is required`);
-  }
-  if (!Number.isFinite(data.price) || data.price <= 0) throw new HttpError(400, "Price must be greater than 0");
-  if (!RENTAL_TYPES.includes(data.rentalType)) throw new HttpError(400, "Rental type must be Daily, Weekly or Monthly");
-  if (!Number.isInteger(data.quantity) || data.quantity < 0) throw new HttpError(400, "Quantity must be a whole number (0 or more)");
-  if (!/^https?:\/\//.test(data.image)) throw new HttpError(400, "Image must be a valid URL");
-  data.price = money(data.price);
-  return data;
-}
-
-// How many units are free for the whole date range?
-async function getAvailableQuantity(equipment, start, end, excludeBookingId = null) {
-  const query = {
-    equipmentId: equipment._id,
-    startDate: { $lte: end },
-    endDate: { $gte: start },
-    $or: [{ status: "confirmed" }, { status: "pending", holdUntil: { $gt: new Date() } }],
-  };
-  if (excludeBookingId) query._id = { $ne: excludeBookingId };
-  const overlapping = await col.bookings.find(query).toArray();
-
-  let peak = 0; // highest number of units used on any single day
-  for (let t = start.getTime(); t <= end.getTime(); t += DAY_MS) {
-    let used = 0;
-    for (const b of overlapping) {
-      if (b.startDate.getTime() <= t && b.endDate.getTime() >= t) used += b.quantity;
-    }
-    peak = Math.max(peak, used);
-  }
-  return equipment.quantity - peak;
-}
-
-function validateDates(startStr, endStr) {
-  const start = parseDate(startStr);
-  const end = parseDate(endStr);
-  if (!start || !end) throw new HttpError(400, "Dates must be in YYYY-MM-DD format");
-  if (start < todayUTC()) throw new HttpError(400, "Start date cannot be in the past");
-  if (end < start) throw new HttpError(400, "End date cannot be before start date");
-  const days = Math.round((end - start) / DAY_MS) + 1;
-  if (days > MAX_RENTAL_DAYS) throw new HttpError(400, `Maximum rental period is ${MAX_RENTAL_DAYS} days`);
-  return { start, end, days };
-}
-
-function calculateTotal(equipment, days, quantity) {
-  const units =
-    equipment.rentalType === "Daily" ? days : equipment.rentalType === "Weekly" ? Math.ceil(days / 7) : Math.ceil(days / 30);
-  return { units, total: money(units * equipment.price * quantity) };
-}
-
-// Use the website the request came from (localhost or Vercel) if it is allowed
-const clientBase = (req) => (CLIENT_URLS.includes(req.headers.origin) ? req.headers.origin : CLIENT_URLS[0]);
-
-async function createCheckoutSession(booking, customerEmail, baseUrl) {
-  const session = await stripe.checkout.sessions.create({
-    mode: "payment",
-    customer_email: customerEmail,
-    client_reference_id: booking._id.toString(),
-    metadata: { bookingId: booking._id.toString() },
-    line_items: [
-      {
-        quantity: 1,
-        price_data: {
-          currency: "usd",
-          unit_amount: Math.round(booking.totalAmount * 100),
-          product_data: {
-            name: `${booking.equipmentName} x${booking.quantity}`,
-            description: `Rental: ${booking.startDate.toISOString().slice(0, 10)} to ${booking.endDate.toISOString().slice(0, 10)}`,
-          },
-        },
-      },
-    ],
-    expires_at: Math.floor(Date.now() / 1000) + 31 * 60,
-    success_url: `${baseUrl}/payment/success?booking_id=${booking._id}`,
-    cancel_url: `${baseUrl}/payment/cancel?booking_id=${booking._id}`,
+const app = express();
+app.disable('etag');
+app.use((_req, res, next) => {
+  res.set({
+    'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+    Pragma: 'no-cache',
+    Expires: '0',
+    'Surrogate-Control': 'no-store',
   });
-  await col.bookings.updateOne(
-    { _id: booking._id },
-    { $set: { stripeSessionId: session.id, holdUntil: new Date(Date.now() + HOLD_MS) } }
+  next();
+});
+
+const port = Number(process.env.PORT || 5000);
+const dbName = process.env.DB_NAME || 'rentgear';
+const jwtSecret = process.env.JWT_SECRET;
+const authBaseUrl = (process.env.BETTER_AUTH_URL || `http://localhost:${port}`).replace(/\/$/, '');
+const betterAuthSecret = process.env.BETTER_AUTH_SECRET;
+const stripeKey = process.env.STRIPE_SECRET_KEY || '';
+const stripe = /^(?:sk|rk)_(?:test|live)_[A-Za-z0-9]+$/.test(stripeKey) && !/^(?:sk|rk)_(?:test|live)_x+$/i.test(stripeKey)
+  ? new Stripe(stripeKey)
+  : null;
+const clientOrigins = (process.env.CLIENT_URLS || 'http://localhost:3000')
+  .split(',').map((value) => value.trim()).filter(Boolean);
+const adminEmails = new Set((process.env.ADMIN_EMAILS || '').split(',').map((x) => x.trim().toLowerCase()).filter(Boolean));
+const betterAuthJwks = createRemoteJWKSet(new URL(`${authBaseUrl}/api/auth/jwks`));
+
+if (!jwtSecret || jwtSecret.length < 32) {
+  throw new Error('JWT_SECRET must be set to a random value with at least 32 characters.');
+}
+if (!betterAuthSecret || betterAuthSecret.length < 32) {
+  throw new Error('BETTER_AUTH_SECRET must be set to a random value with at least 32 characters.');
+}
+
+function mongoConnectionString() {
+  if (process.env.MONGODB_URI) return process.env.MONGODB_URI;
+  const { DB_USER, DB_PASSWORD, DB_CLUSTER } = process.env;
+  if (!DB_USER || !DB_PASSWORD || !DB_CLUSTER) {
+    throw new Error('Set MONGODB_URI or DB_USER, DB_PASSWORD and DB_CLUSTER in the server environment.');
+  }
+  const cluster = DB_CLUSTER.replace(/^mongodb\+srv:\/\//, '').replace(/\/$/, '');
+  return `mongodb+srv://${encodeURIComponent(DB_USER)}:${encodeURIComponent(DB_PASSWORD)}@${cluster}/${dbName}?retryWrites=true&w=majority`;
+}
+
+const mongo = new MongoClient(mongoConnectionString(), { serverSelectionTimeoutMS: 10000 });
+let users;
+let equipment;
+let bookings;
+let payments;
+let favorites;
+let reviews;
+let betterAuthHandler;
+
+class HttpError extends Error {
+  constructor(status, message) { super(message); this.status = status; }
+}
+
+const route = (handler) => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
+const fail = (status, message) => { throw new HttpError(status, message); };
+const idOf = (id) => ObjectId.isValid(String(id)) ? new ObjectId(String(id)) : null;
+const asId = (id) => String(id);
+const publicUser = (user) => ({
+  _id: asId(user._id || user.id), name: user.name, email: user.email, role: user.role,
+  photoURL: user.photoURL || user.image || '', phone: user.phone || '', address: user.address || '',
+  createdAt: user.createdAt, ...(user.provider ? { provider: user.provider } : {}),
+});
+const publicEquipment = (item) => ({ ...item, _id: asId(item._id), ownerId: asId(item.ownerId) });
+const publicBooking = (item) => ({ ...item, _id: asId(item._id), equipmentId: asId(item.equipmentId), ownerId: asId(item.ownerId), customerId: asId(item.customerId) });
+const pageArgs = (query) => ({
+  page: Math.max(1, Number.parseInt(query.page, 10) || 1),
+  limit: Math.min(50, Math.max(1, Number.parseInt(query.limit, 10) || 10)),
+});
+const paginated = async (collection, filter, query, sort = { createdAt: -1 }, map = (x) => x) => {
+  const { page, limit } = pageArgs(query);
+  const [items, total] = await Promise.all([
+    collection.find(filter).sort(sort).skip((page - 1) * limit).limit(limit).toArray(),
+    collection.countDocuments(filter),
+  ]);
+  return { items: items.map(map), total, page, pages: Math.ceil(total / limit) };
+};
+const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const dateDays = (start, end) => Math.floor((Date.parse(`${end}T00:00:00Z`) - Date.parse(`${start}T00:00:00Z`)) / 86400000) + 1;
+const rentalUnits = (type, days) => type === 'Weekly' ? Math.ceil(days / 7) : type === 'Monthly' ? Math.ceil(days / 30) : days;
+const now = () => new Date();
+const clientUrl = () => (process.env.NEXT_PUBLIC_SITE_URL || clientOrigins[0] || 'http://localhost:3000').replace(/\/$/, '');
+
+const verifyToken = route(async (req, _res, next) => {
+  const value = req.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
+  if (!value) fail(401, 'Please sign in to continue.');
+  let payload;
+  try {
+    ({ payload } = await jwtVerify(value, betterAuthJwks, {
+      issuer: authBaseUrl,
+      audience: authBaseUrl,
+    }));
+  } catch {
+    try {
+      payload = jwt.verify(value, jwtSecret, { issuer: 'rentgear-api', audience: 'rentgear-client' });
+    } catch {
+      fail(401, 'Your session has expired. Please sign in again.');
+    }
+  }
+  const userId = idOf(payload.sub);
+  const user = userId ? await users.findOne({ _id: userId }) : null;
+  if (!user) fail(401, 'Your account could not be found. Please sign in again.');
+  req.user = user;
+  next();
+});
+const requireRole = (...roles) => (req, _res, next) => {
+  if (!roles.includes(req.user.role)) return next(new HttpError(403, 'You do not have permission to do that.'));
+  next();
+};
+const verifyRenter = requireRole('customer');
+const verifyOwner = requireRole('owner');
+const verifyAdmin = requireRole('admin');
+function validPassword(password) {
+  return typeof password === 'string' && password.length >= 6 && /[a-z]/.test(password) && /[A-Z]/.test(password);
+}
+function validateEquipment(body) {
+  const fields = ['name', 'description', 'category', 'location', 'condition', 'brand', 'model', 'image', 'rentalTerms'];
+  for (const key of fields) if (typeof body[key] !== 'string' || !body[key].trim()) fail(400, `${key} is required.`);
+  if (!/^https?:\/\//i.test(body.image)) fail(400, 'Equipment image must be a valid http(s) URL.');
+  if (!['Daily', 'Weekly', 'Monthly'].includes(body.rentalType)) fail(400, 'Choose a valid rental type.');
+  if (!Number.isFinite(Number(body.price)) || Number(body.price) <= 0) fail(400, 'Price must be greater than zero.');
+  if (!Number.isInteger(Number(body.quantity)) || Number(body.quantity) < 0) fail(400, 'Quantity must be a non-negative whole number.');
+}
+function dateRange(start, end) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(start || '') || !/^\d{4}-\d{2}-\d{2}$/.test(end || '')) fail(400, 'Choose a valid start and end date.');
+  const startInstant = new Date(`${start}T00:00:00Z`); const endInstant = new Date(`${end}T00:00:00Z`);
+  if (Number.isNaN(startInstant.getTime()) || Number.isNaN(endInstant.getTime()) || startInstant.toISOString().slice(0, 10) !== start || endInstant.toISOString().slice(0, 10) !== end) fail(400, 'Choose valid calendar dates.');
+  const days = dateDays(start, end);
+  if (!Number.isInteger(days) || days < 1 || days > 366) fail(400, 'Rental dates must be within one year.');
+  if (start < new Date().toISOString().slice(0, 10)) fail(400, 'Rental start date cannot be in the past.');
+  return days;
+}
+async function getEquipment(id) {
+  const objectId = idOf(id);
+  if (!objectId) fail(400, 'Invalid equipment id.');
+  const item = await equipment.findOne({ _id: objectId });
+  if (!item) fail(404, 'Equipment was not found.');
+  return item;
+}
+async function getBooking(id) {
+  const objectId = idOf(id);
+  if (!objectId) fail(400, 'Invalid booking id.');
+  const item = await bookings.findOne({ _id: objectId });
+  if (!item) fail(404, 'Booking was not found.');
+  return item;
+}
+function canReadBooking(booking, user) {
+  return user.role === 'admin' || String(booking.customerId) === String(user._id) || String(booking.ownerId) === String(user._id);
+}
+const activeBookingFilter = (startDate, endDate) => ({
+  startDate: { $lte: endDate }, endDate: { $gte: startDate },
+  status: { $in: ['pending', 'confirmed'] },
+  $or: [
+    { paymentStatus: 'paid' },
+    { paymentStatus: 'unpaid', holdUntil: { $gt: now() } },
+  ],
+});
+async function availableQuantity(item, startDate, endDate, session) {
+  const reserved = await bookings.find({ equipmentId: item._id, ...activeBookingFilter(startDate, endDate) }, { session }).toArray();
+  return Math.max(0, item.quantity - reserved.reduce((sum, row) => sum + row.quantity, 0));
+}
+async function updateBookingPaid(booking, session) {
+  if (!booking || session.payment_status !== 'paid') return booking;
+  const paymentIntent = typeof session.payment_intent === 'string' ? session.payment_intent : session.payment_intent?.id;
+  const updated = await bookings.findOneAndUpdate(
+    { _id: booking._id, paymentStatus: { $ne: 'paid' } },
+    { $set: { paymentStatus: 'paid', status: 'confirmed', paidAt: now(), transactionId: paymentIntent || session.id, stripeSessionId: session.id } },
+    { returnDocument: 'after' },
   );
+  const paidBooking = updated || await bookings.findOne({ _id: booking._id });
+  if (paidBooking?.paymentStatus === 'paid') {
+    await payments.updateOne(
+      { stripeSessionId: session.id },
+      { $setOnInsert: { bookingId: paidBooking._id, customerId: paidBooking.customerId, ownerId: paidBooking.ownerId, amount: paidBooking.totalAmount, currency: session.currency || 'usd', status: 'paid', stripeSessionId: session.id, transactionId: paymentIntent || session.id, createdAt: paidBooking.paidAt || now() } },
+      { upsert: true },
+    );
+  }
+  return paidBooking;
+}
+async function createCheckout(booking) {
+  if (!stripe) fail(503, 'Secure checkout is not configured yet.');
+  if (booking.stripeSessionId) {
+    const existing = await stripe.checkout.sessions.retrieve(booking.stripeSessionId);
+    if (existing.payment_status === 'paid') {
+      await updateBookingPaid(booking, existing);
+      fail(409, 'This booking has already been paid.');
+    }
+    if (existing.status === 'open' && existing.url && new Date(booking.holdUntil || 0) > now()) return existing;
+  }
+  const expiresAt = Math.floor((Date.now() + 35 * 60 * 1000) / 1000);
+  const session = await stripe.checkout.sessions.create({
+    mode: 'payment',
+    payment_method_types: ['card'],
+    customer_email: booking.customerEmail,
+    line_items: [{
+      quantity: 1,
+      price_data: {
+        currency: 'usd', unit_amount: Math.round(booking.totalAmount * 100),
+        product_data: { name: booking.equipmentName, description: `${booking.startDate} to ${booking.endDate} · ${booking.quantity} unit(s)` },
+      },
+    }],
+    metadata: { bookingId: asId(booking._id), customerId: asId(booking.customerId) },
+    payment_intent_data: { metadata: { bookingId: asId(booking._id) } },
+    expires_at: expiresAt,
+    success_url: `${clientUrl()}/payment/success?booking_id=${booking._id}&session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${clientUrl()}/payment/cancel?booking_id=${booking._id}`,
+  });
+  if (!session.url) fail(502, 'Stripe did not return a checkout link. Please try again.');
+  await bookings.updateOne({ _id: booking._id }, { $set: { stripeSessionId: session.id, holdUntil: new Date(expiresAt * 1000) } });
   return session;
 }
 
-// ---------------------------------------------------------------------
-// 6. APP + STRIPE WEBHOOK (must be BEFORE express.json)
-// ---------------------------------------------------------------------
-const app = express();
-app.use(helmet());
-app.use(
-  cors({
-    origin: CLIENT_URLS,
-    credentials: true,
-  })
-);
+// Stripe requires the unparsed request body for signature verification.
+app.post('/api/payments/webhook', express.raw({ type: 'application/json' }), route(async (req, res) => {
+  if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) fail(503, 'Payment webhooks are not configured.');
+  let event;
+  try { event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], process.env.STRIPE_WEBHOOK_SECRET); }
+  catch { fail(400, 'Invalid Stripe webhook signature.'); }
+  if (event.type === 'checkout.session.completed' || event.type === 'checkout.session.async_payment_succeeded') {
+    const session = event.data.object;
+    const bookingId = idOf(session.metadata?.bookingId);
+    if (bookingId && session.payment_status === 'paid') {
+      const booking = await bookings.findOne({ _id: bookingId });
+      if (booking) await updateBookingPaid(booking, session);
+    }
+  }
+  if (event.type === 'checkout.session.expired') {
+    const session = event.data.object;
+    await bookings.updateOne({ stripeSessionId: session.id, paymentStatus: 'unpaid', status: 'pending' }, { $set: { paymentStatus: 'expired', status: 'cancelled' } });
+  }
+  res.json({ received: true });
+}));
 
-async function markBookingPaid(session) {
-  const bookingId = session.metadata?.bookingId;
-  if (!bookingId || !ObjectId.isValid(bookingId)) return;
-  const booking = await col.bookings.findOne({ _id: new ObjectId(bookingId) });
-  if (!booking) return;
-  // Verify the amount Stripe charged really matches our booking
-  if (session.amount_total !== Math.round(booking.totalAmount * 100)) {
-    console.error("Stripe amount mismatch for booking", bookingId);
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+app.use(cors({ origin(origin, callback) {
+  if (!origin || clientOrigins.includes(origin)) return callback(null, true);
+  return callback(new HttpError(403, 'This site is not allowed to access the API.'));
+}, credentials: true }));
+app.all('/api/auth/*', (req, res, next) => {
+  if (!betterAuthHandler) return next(new HttpError(503, 'Authentication is still starting.'));
+  betterAuthHandler(req, res).catch(next);
+});
+app.use(express.json({ limit: '1mb' }));
+app.get('/', (_req, res) => res.json({ name: 'RentGear API', status: 'ok' }));
+app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
+
+// ---------------- Profile ----------------
+app.get('/api/users/me', verifyToken, route(async (req, res) => res.json({ user: publicUser(req.user) })));
+app.patch('/api/users/me', verifyToken, route(async (req, res) => {
+  const update = {};
+  for (const key of ['name', 'photoURL', 'phone', 'address']) {
+    if (typeof req.body[key] === 'string') update[key] = req.body[key].trim();
+  }
+  if (update.name !== undefined && (update.name.length < 2 || update.name.length > 80)) fail(400, 'Name must be between 2 and 80 characters.');
+  if (update.photoURL && !/^https?:\/\//i.test(update.photoURL)) fail(400, 'Photo URL must use http or https.');
+  update.updatedAt = now();
+  const fresh = await users.findOneAndUpdate({ _id: req.user._id }, { $set: update }, { returnDocument: 'after' });
+  res.json({ user: publicUser(fresh) });
+}));
+
+// ---------------- Public and owner equipment ----------------
+app.get('/api/equipment/featured', route(async (_req, res) => {
+  const items = await equipment.find({ status: 'approved', quantity: { $gt: 0 } }).sort({ createdAt: -1 }).limit(6).toArray();
+  res.json({ items: items.map(publicEquipment) });
+}));
+app.get('/api/equipment/categories', route(async (_req, res) => {
+  const items = await equipment.aggregate([
+    { $match: { status: 'approved', quantity: { $gt: 0 } } },
+    { $group: { _id: '$category', count: { $sum: 1 } } },
+    { $sort: { count: -1, _id: 1 } }, { $limit: 24 },
+  ]).toArray();
+  res.json({ items: items.map((row) => ({ category: row._id, count: row.count })) });
+}));
+app.get('/api/equipment', route(async (req, res) => {
+  const filter = { status: 'approved' };
+  const term = String(req.query.search || '').trim();
+  if (term) filter.$or = [{ name: { $regex: escapeRegex(term), $options: 'i' } }, { category: { $regex: escapeRegex(term), $options: 'i' } }];
+  if (req.query.location) filter.location = { $regex: escapeRegex(req.query.location), $options: 'i' };
+  if (req.query.category) filter.category = String(req.query.category);
+  if (req.query.rentalType) {
+    if (!['Daily', 'Weekly', 'Monthly'].includes(req.query.rentalType)) fail(400, 'Choose a valid rental type.');
+    filter.rentalType = String(req.query.rentalType);
+  }
+  if (req.query.available === 'true') filter.quantity = { $gt: 0 };
+  if (req.query.minPrice || req.query.maxPrice) filter.price = {};
+  if (req.query.minPrice) {
+    const minPrice = Number(req.query.minPrice);
+    if (!Number.isFinite(minPrice) || minPrice < 0) fail(400, 'Minimum price must be a non-negative number.');
+    filter.price.$gte = minPrice;
+  }
+  if (req.query.maxPrice) {
+    const maxPrice = Number(req.query.maxPrice);
+    if (!Number.isFinite(maxPrice) || maxPrice < 0) fail(400, 'Maximum price must be a non-negative number.');
+    filter.price.$lte = maxPrice;
+  }
+  if (filter.price?.$gte !== undefined && filter.price?.$lte !== undefined && filter.price.$gte > filter.price.$lte) fail(400, 'Minimum price cannot exceed maximum price.');
+  const sort = req.query.sort === 'price_asc' ? { price: 1 } : req.query.sort === 'price_desc' ? { price: -1 } : { createdAt: -1 };
+  res.json(await paginated(equipment, filter, req.query, sort, publicEquipment));
+}));
+app.get('/api/equipment/:id/availability', route(async (req, res) => {
+  const item = await getEquipment(req.params.id);
+  if (item.status !== 'approved') fail(404, 'Equipment is not available.');
+  const startDate = String(req.query.startDate || ''); const endDate = String(req.query.endDate || '');
+  const days = dateRange(startDate, endDate);
+  const quantity = Math.max(1, Math.floor(Number(req.query.quantity) || 1));
+  const available = await availableQuantity(item, startDate, endDate);
+  const units = rentalUnits(item.rentalType, days);
+  res.json({ available, days, estimate: { units, total: item.price * units * quantity } });
+}));
+app.get('/api/equipment/:id/reviews', route(async (req, res) => {
+  const itemId = idOf(req.params.id); if (!itemId) fail(400, 'Invalid equipment id.');
+  const rows = await reviews.find({ equipmentId: itemId }).sort({ createdAt: -1 }).limit(50).toArray();
+  res.json({ items: rows.map((row) => ({ ...row, _id: asId(row._id), equipmentId: asId(row.equipmentId), userId: asId(row.userId), bookingId: asId(row.bookingId) })) });
+}));
+app.get('/api/equipment/:id', route(async (req, res) => {
+  const item = await getEquipment(req.params.id);
+  if (item.status !== 'approved') {
+    const auth = req.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
+    let caller = null;
+    try { const payload = jwt.verify(auth || '', jwtSecret); caller = await users.findOne({ _id: idOf(payload.sub) }); } catch { /* public caller */ }
+    if (!caller || (caller.role !== 'admin' && String(caller._id) !== String(item.ownerId))) fail(404, 'Equipment was not found.');
+  }
+  res.json({ item: publicEquipment(item) });
+}));
+
+app.post('/api/equipment', verifyToken, verifyOwner, route(async (req, res) => {
+  validateEquipment(req.body);
+  const item = {
+    ...Object.fromEntries(['name', 'description', 'category', 'location', 'condition', 'brand', 'model', 'image', 'rentalTerms'].map((k) => [k, req.body[k].trim()])),
+    price: Number(req.body.price), rentalType: req.body.rentalType, quantity: Number(req.body.quantity),
+    status: 'pending', ownerId: req.user._id, ownerName: req.user.name, ownerEmail: req.user.email, ownerPhoto: req.user.photoURL || '',
+    createdAt: now(), updatedAt: now(),
+  };
+  const result = await equipment.insertOne(item); item._id = result.insertedId;
+  res.status(201).json({ item: publicEquipment(item) });
+}));
+app.get('/api/owner/equipment', verifyToken, verifyOwner, route(async (req, res) => {
+  res.json(await paginated(equipment, { ownerId: req.user._id }, req.query, { createdAt: -1 }, publicEquipment));
+}));
+app.put('/api/equipment/:id', verifyToken, verifyOwner, route(async (req, res) => {
+  validateEquipment(req.body);
+  const objectId = idOf(req.params.id); if (!objectId) fail(400, 'Invalid equipment id.');
+  const update = { ...Object.fromEntries(['name', 'description', 'category', 'location', 'condition', 'brand', 'model', 'image', 'rentalTerms'].map((k) => [k, req.body[k].trim()])), price: Number(req.body.price), rentalType: req.body.rentalType, quantity: Number(req.body.quantity), status: 'pending', updatedAt: now() };
+  const item = await equipment.findOneAndUpdate({ _id: objectId, ownerId: req.user._id }, { $set: update }, { returnDocument: 'after' });
+  if (!item) fail(404, 'Equipment was not found in your listings.');
+  res.json({ item: publicEquipment(item) });
+}));
+app.delete('/api/equipment/:id', verifyToken, verifyOwner, route(async (req, res) => {
+  const objectId = idOf(req.params.id); if (!objectId) fail(400, 'Invalid equipment id.');
+  const pending = await bookings.findOne({ equipmentId: objectId, status: { $in: ['pending', 'confirmed'] } });
+  if (pending) fail(409, 'This equipment has an active booking and cannot be deleted.');
+  const result = await equipment.deleteOne({ _id: objectId, ownerId: req.user._id });
+  if (!result.deletedCount) fail(404, 'Equipment was not found in your listings.');
+  res.json({ success: true });
+}));
+
+// ---------------- Favorites ----------------
+app.get('/api/favorites/ids', verifyToken, verifyRenter, route(async (req, res) => {
+  const rows = await favorites.find({ userId: req.user._id }).project({ equipmentId: 1 }).toArray();
+  res.json({ ids: rows.map((row) => asId(row.equipmentId)) });
+}));
+app.get('/api/favorites', verifyToken, verifyRenter, route(async (req, res) => {
+  const rows = await favorites.find({ userId: req.user._id }).sort({ createdAt: -1 }).toArray();
+  const ids = rows.map((row) => row.equipmentId);
+  const items = ids.length ? await equipment.find({ _id: { $in: ids } }).toArray() : [];
+  const order = new Map(ids.map((id, index) => [String(id), index]));
+  items.sort((a, b) => order.get(String(a._id)) - order.get(String(b._id)));
+  res.json({ items: items.map(publicEquipment) });
+}));
+app.post('/api/favorites/:id', verifyToken, verifyRenter, route(async (req, res) => {
+  const item = await getEquipment(req.params.id); if (item.status !== 'approved') fail(404, 'Equipment was not found.');
+  await favorites.updateOne({ userId: req.user._id, equipmentId: item._id }, { $setOnInsert: { userId: req.user._id, equipmentId: item._id, createdAt: now() } }, { upsert: true });
+  res.status(201).json({ success: true });
+}));
+app.delete('/api/favorites/:id', verifyToken, verifyRenter, route(async (req, res) => {
+  const itemId = idOf(req.params.id); if (!itemId) fail(400, 'Invalid equipment id.');
+  await favorites.deleteOne({ userId: req.user._id, equipmentId: itemId }); res.json({ success: true });
+}));
+
+// ---------------- Bookings and Stripe checkout ----------------
+app.get('/api/bookings/my', verifyToken, verifyRenter, route(async (req, res) => {
+  res.json(await paginated(bookings, { customerId: req.user._id }, req.query, { createdAt: -1 }, publicBooking));
+}));
+app.get('/api/bookings/owner', verifyToken, verifyOwner, route(async (req, res) => {
+  res.json(await paginated(bookings, { ownerId: req.user._id }, req.query, { createdAt: -1 }, publicBooking));
+}));
+app.get('/api/admin/bookings', verifyToken, verifyAdmin, route(async (req, res) => {
+  res.json(await paginated(bookings, {}, req.query, { createdAt: -1 }, publicBooking));
+}));
+app.patch('/api/admin/bookings/:id/status', verifyToken, verifyAdmin, route(async (req, res) => {
+  const booking = await getBooking(req.params.id);
+  if (req.body.status === 'cancelled') {
+    if (booking.status !== 'pending' || booking.paymentStatus !== 'unpaid') {
+      fail(409, 'Only unpaid pending bookings can be cancelled.');
+    }
+    if (booking.stripeSessionId) {
+      if (!stripe) fail(503, 'Stripe is required to safely cancel this booking.');
+      const checkout = await stripe.checkout.sessions.retrieve(booking.stripeSessionId);
+      if (checkout.payment_status === 'paid') {
+        await updateBookingPaid(booking, checkout);
+        fail(409, 'This booking has already been paid and cannot be cancelled.');
+      }
+      if (checkout.status === 'open') await stripe.checkout.sessions.expire(booking.stripeSessionId);
+    }
+    const updated = await bookings.findOneAndUpdate(
+      { _id: booking._id, status: 'pending', paymentStatus: 'unpaid' },
+      { $set: { status: 'cancelled' } },
+      { returnDocument: 'after' },
+    );
+    if (!updated) fail(409, 'This booking has already changed and cannot be cancelled.');
+    res.json({ item: publicBooking(updated) });
     return;
   }
-  const result = await col.bookings.updateOne(
-    { _id: booking._id, paymentStatus: { $ne: "paid" } },
-    { $set: { paymentStatus: "paid", status: "confirmed", paidAt: new Date(), transactionId: session.payment_intent || session.id } }
-  );
-  if (result.modifiedCount === 0) return; // already processed (webhook retry)
-  await col.payments.updateOne(
-    { sessionId: session.id },
-    {
-      $setOnInsert: {
-        bookingId: booking._id,
-        customerId: booking.customerId,
-        ownerId: booking.ownerId,
-        equipmentId: booking.equipmentId,
-        sessionId: session.id,
-        paymentIntentId: session.payment_intent || null,
-        amount: money(session.amount_total / 100),
-        currency: session.currency,
-        status: "paid",
-        customerEmail: session.customer_details?.email || session.customer_email || "",
-        createdAt: new Date(),
-      },
-    },
-    { upsert: true }
-  );
-}
-
-app.post(
-  "/api/webhook/stripe",
-  express.raw({ type: "application/json" }),
-  wrap(async (req, res) => {
-    if (!STRIPE_WEBHOOK_SECRET) throw new HttpError(500, "Webhook secret is not configured");
-    let event;
-    try {
-      event = stripe.webhooks.constructEvent(req.body, req.headers["stripe-signature"], STRIPE_WEBHOOK_SECRET);
-    } catch {
-      return res.status(400).send("Invalid webhook signature");
+  if (req.body.status === 'completed') {
+    if (booking.status !== 'confirmed' || booking.paymentStatus !== 'paid') {
+      fail(409, 'Only paid, confirmed rentals can be completed.');
     }
-
-    if (event.type === "checkout.session.completed" || event.type === "checkout.session.async_payment_succeeded") {
-      const session = event.data.object;
-      if (session.payment_status === "paid") await markBookingPaid(session);
-    } else if (event.type === "checkout.session.expired") {
-      const bookingId = event.data.object.metadata?.bookingId;
-      if (bookingId && ObjectId.isValid(bookingId)) {
-        await col.bookings.updateOne(
-          { _id: new ObjectId(bookingId), paymentStatus: "unpaid", status: "pending" },
-          { $set: { status: "cancelled", paymentStatus: "expired" } }
-        );
-      }
-    }
-    res.json({ received: true });
-  })
-);
-
-app.use(express.json({ limit: "10mb" }));
-
-// ---------------------------------------------------------------------
-// 7. ROUTES - HEALTH
-// ---------------------------------------------------------------------
-app.get("/", (req, res) => res.json({ status: "ok", message: "Equipment Rental API is running" }));
-
-// ---------------------------------------------------------------------
-// 8. ROUTES - AUTH
-// ---------------------------------------------------------------------
-// Register: role is ALWAYS "customer". Role changes only through admin API.
-app.post(
-  "/api/auth/register",
-  wrap(async (req, res) => {
-    const name = str(req.body.name, 80);
-    const email = str(req.body.email, 120).toLowerCase();
-    const photoURL = str(req.body.photoURL, 500);
-    if (!name) throw new HttpError(400, "Name is required");
-    if (!isEmail(email)) throw new HttpError(400, "Valid email is required");
-    const passError = validatePassword(req.body.password);
-    if (passError) throw new HttpError(400, passError);
-    if (await col.users.findOne({ email })) throw new HttpError(409, "An account with this email already exists");
-
-    const user = {
-      name,
-      email,
-      passwordHash: await bcrypt.hash(req.body.password, 10),
-      role: "customer",
-      photoURL,
-      phone: "",
-      provider: "password",
-      createdAt: new Date(),
-    };
-    const result = await col.users.insertOne(user);
-    user._id = result.insertedId;
-    res.status(201).json({ token: signToken(user), user: publicUser(user) });
-  })
-);
-
-app.post(
-  "/api/auth/login",
-  wrap(async (req, res) => {
-    const email = str(req.body.email, 120).toLowerCase();
-    const password = typeof req.body.password === "string" ? req.body.password : "";
-    const user = await col.users.findOne({ email });
-    if (!user || !user.passwordHash || !(await bcrypt.compare(password, user.passwordHash))) {
-      throw new HttpError(401, "Invalid email or password");
-    }
-    res.json({ token: signToken(user), user: publicUser(user) });
-  })
-);
-
-// Google login: frontend sends the Google ID token (credential)
-app.post(
-  "/api/auth/google",
-  wrap(async (req, res) => {
-    if (!GOOGLE_CLIENT_ID) throw new HttpError(500, "Google login is not configured");
-    const idToken = str(req.body.idToken, 4000);
-    if (!idToken) throw new HttpError(400, "idToken is required");
-
-    const verify = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`);
-    if (!verify.ok) throw new HttpError(401, "Invalid Google token");
-    const g = await verify.json();
-    if (g.aud !== GOOGLE_CLIENT_ID || g.email_verified !== "true") throw new HttpError(401, "Google token rejected");
-
-    const email = g.email.toLowerCase();
-    let user = await col.users.findOne({ email });
-    if (!user) {
-      user = {
-        name: g.name || email.split("@")[0],
-        email,
-        role: "customer", // Google signup is always customer
-        photoURL: g.picture || "",
-        phone: "",
-        provider: "google",
-        createdAt: new Date(),
-      };
-      user._id = (await col.users.insertOne(user)).insertedId;
-    }
-    res.json({ token: signToken(user), user: publicUser(user) });
-  })
-);
-
-// Persistent login: frontend calls this on reload with the saved token
-app.get("/api/auth/me", verifyToken, (req, res) => res.json({ user: publicUser(req.user) }));
-
-app.patch(
-  "/api/users/me",
-  verifyToken,
-  wrap(async (req, res) => {
-    const update = {};
-    if (req.body.name !== undefined) {
-      update.name = str(req.body.name, 80);
-      if (!update.name) throw new HttpError(400, "Name cannot be empty");
-    }
-    if (req.body.photoURL !== undefined) update.photoURL = str(req.body.photoURL, 500);
-    if (req.body.phone !== undefined) update.phone = str(req.body.phone, 30);
-    if (req.body.address !== undefined) update.address = str(req.body.address, 300);
-    if (!Object.keys(update).length) throw new HttpError(400, "Nothing to update");
-    await col.users.updateOne({ _id: req.user._id }, { $set: update }); // role is never updatable here
-    const user = await col.users.findOne({ _id: req.user._id });
-    res.json({ user: publicUser(user) });
-  })
-);
-
-// ---------------------------------------------------------------------
-// 10. ROUTES - EQUIPMENT (public)
-// ---------------------------------------------------------------------
-app.get(
-  "/api/equipment",
-  wrap(async (req, res) => {
-    const { page, limit, skip } = paginate(req, 9);
-    const q = req.query;
-    const filter = { status: "approved" }; // only approved items are public
-
-    if (str(q.search)) filter.name = { $regex: escapeRegex(str(q.search, 100)), $options: "i" };
-    if (str(q.location)) filter.location = { $regex: escapeRegex(str(q.location, 100)), $options: "i" };
-    if (str(q.category)) filter.category = { $regex: `^${escapeRegex(str(q.category, 60))}$`, $options: "i" };
-    if (RENTAL_TYPES.includes(str(q.rentalType))) filter.rentalType = str(q.rentalType);
-    if (q.available === "true") filter.quantity = { $gt: 0 };
-
-    const min = Number(q.minPrice);
-    const max = Number(q.maxPrice);
-    if ((q.minPrice !== undefined && q.minPrice !== "" && Number.isFinite(min)) || (q.maxPrice !== undefined && q.maxPrice !== "" && Number.isFinite(max))) {
-      filter.price = {};
-      if (q.minPrice !== "" && Number.isFinite(min)) filter.price.$gte = min;
-      if (q.maxPrice !== "" && Number.isFinite(max)) filter.price.$lte = max;
-    }
-
-    const sorts = { price_asc: { price: 1 }, price_desc: { price: -1 }, newest: { createdAt: -1 } };
-    const sort = sorts[q.sort] || sorts.newest;
-
-    const [items, total] = await Promise.all([
-      col.equipment.find(filter).sort(sort).skip(skip).limit(limit).toArray(),
-      col.equipment.countDocuments(filter),
-    ]);
-    res.json(pageResult(items, total, page, limit));
-  })
-);
-
-app.get(
-  "/api/equipment/featured",
-  wrap(async (req, res) => {
-    const items = await col.equipment.find({ status: "approved" }).sort({ createdAt: -1 }).limit(6).toArray();
-    res.json({ items });
-  })
-);
-
-app.get(
-  "/api/equipment/categories",
-  wrap(async (req, res) => {
-    const items = await col.equipment
-      .aggregate([
-        { $match: { status: "approved" } },
-        { $group: { _id: "$category", count: { $sum: 1 } } },
-        { $sort: { count: -1 } },
-        { $project: { _id: 0, category: "$_id", count: 1 } },
-      ])
-      .toArray();
-    res.json({ items });
-  })
-);
-
-app.get(
-  "/api/equipment/:id",
-  optionalAuth,
-  wrap(async (req, res) => {
-    const item = await col.equipment.findOne({ _id: oid(req.params.id) });
-    if (!item) throw new HttpError(404, "Equipment not found");
-    const canSeeHidden = req.user && (req.user.role === "admin" || item.ownerId.equals(req.user._id));
-    if (item.status !== "approved" && !canSeeHidden) throw new HttpError(404, "Equipment not found");
-    res.json({ item });
-  })
-);
-
-app.get(
-  "/api/equipment/:id/availability",
-  wrap(async (req, res) => {
-    const item = await col.equipment.findOne({ _id: oid(req.params.id), status: "approved" });
-    if (!item) throw new HttpError(404, "Equipment not found");
-    const { start, end, days } = validateDates(req.query.startDate, req.query.endDate);
-    const available = await getAvailableQuantity(item, start, end);
-    const quantity = Math.max(parseInt(req.query.quantity) || 1, 1);
-    res.json({ available, days, estimate: calculateTotal(item, days, quantity) });
-  })
-);
-
-app.get(
-  "/api/equipment/:id/reviews",
-  wrap(async (req, res) => {
-    const items = await col.reviews.find({ equipmentId: oid(req.params.id) }).sort({ createdAt: -1 }).limit(50).toArray();
-    res.json({ items });
-  })
-);
-
-// ---------------------------------------------------------------------
-// 11. ROUTES - EQUIPMENT (owner)
-// ---------------------------------------------------------------------
-app.post(
-  "/api/equipment",
-  verifyOwner,
-  wrap(async (req, res) => {
-    const data = validateEquipment(req.body);
-    const item = {
-      ...data,
-      status: "pending", // admin must approve
-      ownerId: req.user._id, // owner info comes from the token, not from the client
-      ownerName: req.user.name,
-      ownerEmail: req.user.email,
-      ownerPhoto: req.user.photoURL || "",
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    };
-    item._id = (await col.equipment.insertOne(item)).insertedId;
-    res.status(201).json({ item });
-  })
-);
-
-app.get(
-  "/api/owner/equipment",
-  verifyOwner,
-  wrap(async (req, res) => {
-    const { page, limit, skip } = paginate(req);
-    const filter = { ownerId: req.user._id };
-    const [items, total] = await Promise.all([
-      col.equipment.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
-      col.equipment.countDocuments(filter),
-    ]);
-    res.json(pageResult(items, total, page, limit));
-  })
-);
-
-app.put(
-  "/api/equipment/:id",
-  verifyOwner,
-  wrap(async (req, res) => {
-    const _id = oid(req.params.id);
-    const data = validateEquipment(req.body);
-    // After an edit the listing goes back to "pending" for admin re-approval
-    const result = await col.equipment.findOneAndUpdate(
-      { _id, ownerId: req.user._id },
-      { $set: { ...data, status: "pending", updatedAt: new Date() } },
-      { returnDocument: "after" }
+    const updated = await bookings.findOneAndUpdate(
+      { _id: booking._id, status: 'confirmed', paymentStatus: 'paid' },
+      { $set: { status: 'completed', completedAt: now() } },
+      { returnDocument: 'after' },
     );
-    if (!result) throw new HttpError(404, "Equipment not found or not yours");
-    res.json({ item: result });
-  })
-);
-
-app.delete(
-  "/api/equipment/:id",
-  verifyToken,
-  wrap(async (req, res) => {
-    if (!["owner", "admin"].includes(req.user.role)) throw new HttpError(403, "Forbidden");
-    const _id = oid(req.params.id);
-    const filter = req.user.role === "admin" ? { _id } : { _id, ownerId: req.user._id };
-    const item = await col.equipment.findOne(filter);
-    if (!item) throw new HttpError(404, "Equipment not found or not yours");
-
-    const active = await col.bookings.countDocuments({
-      equipmentId: _id,
-      $or: [{ status: "confirmed" }, { status: "pending", holdUntil: { $gt: new Date() } }],
+    if (!updated) fail(409, 'This booking has already changed and cannot be completed.');
+    res.json({ item: publicBooking(updated) });
+    return;
+  }
+  fail(400, 'Admins can only cancel unpaid pending bookings or complete paid rentals.');
+}));
+app.get('/api/bookings/:id', verifyToken, route(async (req, res) => {
+  const booking = await getBooking(req.params.id); if (!canReadBooking(booking, req.user)) fail(404, 'Booking was not found.');
+  res.json({ item: publicBooking(booking) });
+}));
+app.post('/api/bookings', verifyToken, verifyRenter, route(async (req, res) => {
+  const item = await getEquipment(req.body.equipmentId); if (item.status !== 'approved') fail(404, 'Equipment is not available for booking.');
+  const startDate = String(req.body.startDate || ''); const endDate = String(req.body.endDate || '');
+  const days = dateRange(startDate, endDate);
+  const quantity = Math.floor(Number(req.body.quantity));
+  if (!Number.isInteger(quantity) || quantity < 1 || quantity > 100) fail(400, 'Choose a valid rental quantity.');
+  const available = await availableQuantity(item, startDate, endDate);
+  if (quantity > available) fail(409, `Only ${available} unit(s) are available for those dates.`);
+  const phone = String(req.body.phone || '').trim(); const address = String(req.body.address || '').trim();
+  if (!phone || !address) fail(400, 'Phone number and delivery address are required.');
+  const units = rentalUnits(item.rentalType, days);
+  const booking = {
+    equipmentId: item._id, equipmentName: item.name, equipmentImage: item.image, ownerId: item.ownerId,
+    customerId: req.user._id, customerName: req.user.name, customerEmail: req.user.email,
+    startDate, endDate, days, rentalType: item.rentalType, rentalUnits: units, pricePerUnit: item.price,
+    quantity, totalAmount: Math.round(item.price * units * quantity * 100) / 100,
+    phone, address, notes: String(req.body.notes || '').trim().slice(0, 500),
+    status: 'pending', paymentStatus: 'unpaid', createdAt: now(),
+  };
+  const mongoSession = mongo.startSession();
+  try {
+    await mongoSession.withTransaction(async () => {
+      // Serialize reservations for one listing so concurrent checkouts cannot overbook it.
+      await equipment.updateOne({ _id: item._id }, { $inc: { reservationVersion: 1 } }, { session: mongoSession });
+      const availableNow = await availableQuantity(item, startDate, endDate, mongoSession);
+      if (quantity > availableNow) fail(409, `Only ${availableNow} unit(s) are available for those dates.`);
+      const inserted = await bookings.insertOne(booking, { session: mongoSession });
+      booking._id = inserted.insertedId;
     });
-    if (active > 0) throw new HttpError(409, "Cannot delete equipment with active bookings");
-
-    await col.equipment.deleteOne({ _id });
-    await col.favorites.deleteMany({ equipmentId: _id });
-    res.json({ message: "Equipment deleted" });
-  })
-);
-
-// ---------------------------------------------------------------------
-// 12. ROUTES - FAVORITES (customer)
-// ---------------------------------------------------------------------
-app.get(
-  "/api/favorites",
-  verifyRenter,
-  wrap(async (req, res) => {
-    const items = await col.favorites
-      .aggregate([
-        { $match: { userId: req.user._id } },
-        { $sort: { createdAt: -1 } },
-        { $lookup: { from: "equipment", localField: "equipmentId", foreignField: "_id", as: "equipment" } },
-        { $unwind: "$equipment" },
-        { $replaceRoot: { newRoot: { $mergeObjects: ["$equipment", { favoriteId: "$_id" }] } } },
-      ])
-      .toArray();
-    res.json({ items });
-  })
-);
-
-app.get(
-  "/api/favorites/ids",
-  verifyRenter,
-  wrap(async (req, res) => {
-    const list = await col.favorites.find({ userId: req.user._id }).project({ equipmentId: 1 }).toArray();
-    res.json({ ids: list.map((f) => f.equipmentId.toString()) });
-  })
-);
-
-app.post(
-  "/api/favorites/:equipmentId",
-  verifyRenter,
-  wrap(async (req, res) => {
-    const equipmentId = oid(req.params.equipmentId);
-    const item = await col.equipment.findOne({ _id: equipmentId, status: "approved" });
-    if (!item) throw new HttpError(404, "Equipment not found");
-    await col.favorites.updateOne(
-      { userId: req.user._id, equipmentId },
-      { $setOnInsert: { userId: req.user._id, equipmentId, createdAt: new Date() } },
-      { upsert: true }
-    );
-    res.status(201).json({ message: "Added to favorites" });
-  })
-);
-
-app.delete(
-  "/api/favorites/:equipmentId",
-  verifyRenter,
-  wrap(async (req, res) => {
-    await col.favorites.deleteOne({ userId: req.user._id, equipmentId: oid(req.params.equipmentId) });
-    res.json({ message: "Removed from favorites" });
-  })
-);
-
-// ---------------------------------------------------------------------
-// 13. ROUTES - BOOKINGS
-// ---------------------------------------------------------------------
-app.post(
-  "/api/bookings",
-  verifyRenter,
-  wrap(async (req, res) => {
-    const b = req.body;
-    const equipment = await col.equipment.findOne({ _id: oid(b.equipmentId), status: "approved" });
-    if (!equipment) throw new HttpError(404, "Equipment not found");
-    if (equipment.ownerId.equals(req.user._id)) throw new HttpError(400, "You cannot book your own equipment");
-
-    const { start, end, days } = validateDates(b.startDate, b.endDate);
-    const quantity = Number(b.quantity);
-    if (!Number.isInteger(quantity) || quantity < 1) throw new HttpError(400, "Quantity must be at least 1");
-
-    const phone = str(b.phone, 30);
-    const address = str(b.address, 300);
-    if (!/^[0-9+\-\s()]{7,20}$/.test(phone)) throw new HttpError(400, "Valid contact number is required");
-    if (!address) throw new HttpError(400, "Delivery address is required");
-
-    const available = await getAvailableQuantity(equipment, start, end);
-    if (quantity > available) {
-      throw new HttpError(409, available > 0 ? `Only ${available} unit(s) available for these dates` : "Not available for these dates");
+    const checkout = await createCheckout(booking);
+    res.status(201).json({ bookingId: asId(booking._id), checkoutUrl: checkout.url });
+  } catch (error) {
+    if (booking._id) await bookings.deleteOne({ _id: booking._id, paymentStatus: 'unpaid' });
+    throw error;
+  } finally {
+    await mongoSession.endSession();
+  }
+}));
+app.post('/api/bookings/:id/pay', verifyToken, verifyRenter, route(async (req, res) => {
+  const booking = await getBooking(req.params.id);
+  if (String(booking.customerId) !== String(req.user._id)) fail(404, 'Booking was not found.');
+  if (booking.paymentStatus === 'paid') fail(409, 'This booking has already been paid.');
+  if (booking.status !== 'pending' || new Date(booking.holdUntil || 0) <= now()) fail(409, 'This booking hold has expired. Create a new booking to continue.');
+  const session = await createCheckout(booking);
+  res.json({ checkoutUrl: session.url });
+}));
+app.patch('/api/bookings/:id/cancel', verifyToken, verifyRenter, route(async (req, res) => {
+  const booking = await getBooking(req.params.id);
+  if (String(booking.customerId) !== String(req.user._id)) fail(404, 'Booking was not found.');
+  if (booking.paymentStatus === 'paid' || booking.status !== 'pending') fail(409, 'This booking can no longer be cancelled online.');
+  if (stripe && booking.stripeSessionId) {
+    const checkout = await stripe.checkout.sessions.retrieve(booking.stripeSessionId);
+    if (checkout.payment_status === 'paid') {
+      await updateBookingPaid(booking, checkout);
+      fail(409, 'This booking has already been paid and cannot be cancelled.');
     }
+    if (checkout.status === 'open') await stripe.checkout.sessions.expire(booking.stripeSessionId);
+  }
+  const updated = await bookings.findOneAndUpdate({ _id: booking._id, paymentStatus: 'unpaid', status: 'pending' }, { $set: { status: 'cancelled' } }, { returnDocument: 'after' });
+  if (!updated) fail(409, 'This booking has already changed and cannot be cancelled.');
+  res.json({ item: publicBooking(updated) });
+}));
+app.post('/api/bookings/:id/verify', verifyToken, verifyRenter, route(async (req, res) => {
+  if (!stripe) fail(503, 'Payment verification is not configured.');
+  let booking = await getBooking(req.params.id);
+  if (String(booking.customerId) !== String(req.user._id)) fail(404, 'Booking was not found.');
+  if (booking.stripeSessionId && booking.paymentStatus !== 'paid') {
+    const session = await stripe.checkout.sessions.retrieve(booking.stripeSessionId);
+    if (session.payment_status === 'paid') booking = await updateBookingPaid(booking, session);
+  }
+  res.json({ item: publicBooking(booking) });
+}));
+app.patch('/api/bookings/:id/status', verifyToken, verifyOwner, route(async (req, res) => {
+  if (req.body.status !== 'completed') fail(400, 'Owners can only mark a rental completed.');
+  const booking = await getBooking(req.params.id);
+  if (String(booking.ownerId) !== String(req.user._id)) fail(404, 'Booking was not found.');
+  if (booking.paymentStatus !== 'paid' || booking.status !== 'confirmed') fail(409, 'Only paid, confirmed rentals can be completed.');
+  const updated = await bookings.findOneAndUpdate({ _id: booking._id, status: 'confirmed' }, { $set: { status: 'completed', completedAt: now() } }, { returnDocument: 'after' });
+  res.json({ item: publicBooking(updated) });
+}));
 
-    const { units, total } = calculateTotal(equipment, days, quantity);
-    const booking = {
-      equipmentId: equipment._id,
-      equipmentName: equipment.name,
-      equipmentImage: equipment.image,
-      ownerId: equipment.ownerId,
-      customerId: req.user._id,
-      customerName: req.user.name,
-      customerEmail: req.user.email,
-      startDate: start,
-      endDate: end,
-      days,
-      rentalType: equipment.rentalType,
-      rentalUnits: units,
-      pricePerUnit: equipment.price,
-      quantity,
-      totalAmount: total,
-      phone,
-      address,
-      notes: str(b.notes, 500),
-      status: "pending",
-      paymentStatus: "unpaid",
-      holdUntil: new Date(Date.now() + HOLD_MS),
-      createdAt: new Date(),
-    };
-    booking._id = (await col.bookings.insertOne(booking)).insertedId;
+// ---------------- Admin review and user management ----------------
+app.get('/api/admin/users', verifyToken, verifyAdmin, route(async (req, res) => {
+  const filter = {};
+  if (['customer', 'owner', 'admin'].includes(req.query.role)) filter.role = req.query.role;
+  if (req.query.search) {
+    const regex = { $regex: escapeRegex(req.query.search), $options: 'i' };
+    filter.$or = [{ name: regex }, { email: regex }];
+  }
+  res.json(await paginated(users, filter, req.query, { createdAt: -1 }, publicUser));
+}));
+app.patch('/api/admin/users/:id/role', verifyToken, verifyAdmin, route(async (req, res) => {
+  if (!['customer', 'owner', 'admin'].includes(req.body.role)) fail(400, 'Choose a valid role.');
+  const objectId = idOf(req.params.id); if (!objectId) fail(400, 'Invalid user id.');
+  if (String(objectId) === String(req.user._id)) fail(400, 'You cannot change your own role.');
+  const user = await users.findOneAndUpdate({ _id: objectId }, { $set: { role: req.body.role, updatedAt: now() } }, { returnDocument: 'after' });
+  if (!user) fail(404, 'User was not found.');
+  res.json({ user: publicUser(user) });
+}));
+app.get('/api/admin/equipment', verifyToken, verifyAdmin, route(async (req, res) => {
+  const filter = {};
+  if (['pending', 'approved', 'rejected'].includes(req.query.status)) filter.status = req.query.status;
+  res.json(await paginated(equipment, filter, req.query, { createdAt: -1 }, publicEquipment));
+}));
+app.patch('/api/admin/equipment/:id/status', verifyToken, verifyAdmin, route(async (req, res) => {
+  if (!['pending', 'approved', 'rejected'].includes(req.body.status)) fail(400, 'Choose a valid equipment status.');
+  const objectId = idOf(req.params.id); if (!objectId) fail(400, 'Invalid equipment id.');
+  const item = await equipment.findOneAndUpdate({ _id: objectId }, { $set: { status: req.body.status, updatedAt: now() } }, { returnDocument: 'after' });
+  if (!item) fail(404, 'Equipment was not found.');
+  res.json({ item: publicEquipment(item) });
+}));
+app.put('/api/admin/equipment/:id', verifyToken, verifyAdmin, route(async (req, res) => {
+  validateEquipment(req.body);
+  const objectId = idOf(req.params.id); if (!objectId) fail(400, 'Invalid equipment id.');
+  const data = { ...Object.fromEntries(['name', 'description', 'category', 'location', 'condition', 'brand', 'model', 'image', 'rentalTerms'].map((k) => [k, req.body[k].trim()])), price: Number(req.body.price), quantity: Number(req.body.quantity), rentalType: req.body.rentalType, updatedAt: now() };
+  const item = await equipment.findOneAndUpdate({ _id: objectId }, { $set: data }, { returnDocument: 'after' });
+  if (!item) fail(404, 'Equipment was not found.');
+  res.json({ item: publicEquipment(item) });
+}));
+app.delete('/api/admin/equipment/:id', verifyToken, verifyAdmin, route(async (req, res) => {
+  const objectId = idOf(req.params.id); if (!objectId) fail(400, 'Invalid equipment id.');
+  const result = await equipment.deleteOne({ _id: objectId }); if (!result.deletedCount) fail(404, 'Equipment was not found.');
+  res.json({ success: true });
+}));
 
-    let session;
-    try {
-      session = await createCheckoutSession(booking, req.user.email, clientBase(req));
-    } catch (err) {
-      await col.bookings.deleteOne({ _id: booking._id });
-      throw new HttpError(502, "Could not start payment. Please try again.");
-    }
-    res.status(201).json({ bookingId: booking._id, checkoutUrl: session.url });
-  })
-);
+// ---------------- Reviews ----------------
+app.post('/api/reviews', verifyToken, verifyRenter, route(async (req, res) => {
+  const bookingId = idOf(req.body.bookingId); if (!bookingId) fail(400, 'Invalid booking id.');
+  const booking = await bookings.findOne({ _id: bookingId, customerId: req.user._id, status: 'completed', paymentStatus: 'paid' });
+  if (!booking) fail(403, 'A completed, paid rental is required before reviewing equipment.');
+  const rating = Number(req.body.rating); const comment = String(req.body.comment || '').trim();
+  if (!Number.isInteger(rating) || rating < 1 || rating > 5) fail(400, 'Rating must be between 1 and 5.');
+  if (!comment || comment.length > 1000) fail(400, 'Review must be between 1 and 1000 characters.');
+  if (await reviews.findOne({ bookingId })) fail(409, 'You have already reviewed this rental.');
+  const review = { bookingId, equipmentId: booking.equipmentId, equipmentName: booking.equipmentName, userId: req.user._id, userName: req.user.name, userPhoto: req.user.photoURL || '', rating, comment, createdAt: now() };
+  const result = await reviews.insertOne(review); review._id = result.insertedId;
+  res.status(201).json({ item: { ...review, _id: asId(review._id), bookingId: asId(bookingId), equipmentId: asId(booking.equipmentId), userId: asId(req.user._id) } });
+}));
+app.get('/api/reviews', route(async (req, res) => {
+  const limit = Math.min(12, Math.max(1, Number(req.query.limit) || 6));
+  const items = await reviews.find({}).sort({ createdAt: -1 }).limit(limit).toArray();
+  res.json({ items: items.map((row) => ({ ...row, _id: asId(row._id), bookingId: asId(row.bookingId), equipmentId: asId(row.equipmentId), userId: asId(row.userId) })) });
+}));
 
-app.get(
-  "/api/bookings/my",
-  verifyRenter,
-  wrap(async (req, res) => {
-    const { page, limit, skip } = paginate(req);
-    const filter = { customerId: req.user._id };
-    const [items, total] = await Promise.all([
-      col.bookings.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
-      col.bookings.countDocuments(filter),
-    ]);
-    res.json(pageResult(items, total, page, limit));
-  })
-);
+// ---------------- Role-specific analytics ----------------
+app.get('/api/stats/customer', verifyToken, verifyRenter, route(async (req, res) => {
+  const mine = await bookings.find({ customerId: req.user._id }).toArray();
+  const favCount = await favorites.countDocuments({ userId: req.user._id });
+  res.json({ totalRentals: mine.length, activeRentals: mine.filter((b) => b.status === 'confirmed').length, completedRentals: mine.filter((b) => b.status === 'completed').length, favorites: favCount, totalSpent: mine.filter((b) => b.paymentStatus === 'paid').reduce((sum, b) => sum + b.totalAmount, 0) });
+}));
+app.get('/api/stats/owner', verifyToken, verifyOwner, route(async (req, res) => {
+  const [totalListed, completed, mine] = await Promise.all([
+    equipment.countDocuments({ ownerId: req.user._id }),
+    bookings.countDocuments({ ownerId: req.user._id, status: 'completed' }),
+    payments.find({ ownerId: req.user._id, status: 'paid' }).toArray(),
+  ]);
+  const monthly = new Map();
+  for (let offset = 11; offset >= 0; offset--) {
+    const date = new Date(); date.setUTCDate(1); date.setUTCHours(0, 0, 0, 0); date.setUTCMonth(date.getUTCMonth() - offset);
+    monthly.set(date.toISOString().slice(0, 7), 0);
+  }
+  for (const payment of mine) { const key = new Date(payment.createdAt).toISOString().slice(0, 7); if (monthly.has(key)) monthly.set(key, monthly.get(key) + payment.amount); }
+  res.json({ totalListed, completedRentals: completed, totalEarnings: mine.reduce((sum, p) => sum + p.amount, 0), monthlyEarnings: [...monthly].map(([month, earnings]) => ({ month, earnings })) });
+}));
+app.get('/api/stats/admin', verifyToken, verifyAdmin, route(async (_req, res) => {
+  const [totalUsers, totalEquipment, totalBookings, pendingApprovals, paidPayments, allBookings, roleCounts] = await Promise.all([
+    users.countDocuments({}), equipment.countDocuments({}), bookings.countDocuments({}), equipment.countDocuments({ status: 'pending' }),
+    payments.find({ status: 'paid' }).toArray(), bookings.find({}).project({ createdAt: 1, status: 1 }).toArray(),
+    users.aggregate([{ $group: { _id: '$role', count: { $sum: 1 } } }]).toArray(),
+  ]);
+  const monthly = new Map();
+  for (let offset = 11; offset >= 0; offset--) { const date = new Date(); date.setUTCDate(1); date.setUTCHours(0, 0, 0, 0); date.setUTCMonth(date.getUTCMonth() - offset); monthly.set(date.toISOString().slice(0, 7), 0); }
+  for (const booking of allBookings) { const key = new Date(booking.createdAt).toISOString().slice(0, 7); if (monthly.has(key)) monthly.set(key, monthly.get(key) + 1); }
+  const roleMap = new Map(roleCounts.map((row) => [row._id, row.count]));
+  res.json({ totalUsers, totalEquipment, totalBookings, pendingApprovals, completedRentals: allBookings.filter((b) => b.status === 'completed').length, totalRevenue: paidPayments.reduce((sum, payment) => sum + payment.amount, 0), monthlyBookings: [...monthly].map(([month, count]) => ({ month, bookings: count })), usersByRole: ['customer', 'owner', 'admin'].map((role) => ({ role, count: roleMap.get(role) || 0 })) });
+}));
 
-app.get(
-  "/api/bookings/owner",
-  verifyOwner,
-  wrap(async (req, res) => {
-    const { page, limit, skip } = paginate(req);
-    const filter = { ownerId: req.user._id };
-    const [items, total] = await Promise.all([
-      col.bookings.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
-      col.bookings.countDocuments(filter),
-    ]);
-    res.json(pageResult(items, total, page, limit));
-  })
-);
-
-// Single booking (also used by the payment success page to confirm status)
-app.get(
-  "/api/bookings/:id",
-  verifyToken,
-  wrap(async (req, res) => {
-    const booking = await col.bookings.findOne({ _id: oid(req.params.id) });
-    const u = req.user;
-    const allowed =
-      booking && (u.role === "admin" || booking.customerId.equals(u._id) || booking.ownerId.equals(u._id));
-    if (!allowed) throw new HttpError(404, "Booking not found");
-    res.json({ item: booking });
-  })
-);
-
-// Retry payment for a pending booking
-app.post(
-  "/api/bookings/:id/pay",
-  verifyRenter,
-  wrap(async (req, res) => {
-    const booking = await col.bookings.findOne({ _id: oid(req.params.id), customerId: req.user._id });
-    if (!booking) throw new HttpError(404, "Booking not found");
-    if (booking.status !== "pending" || booking.paymentStatus !== "unpaid") throw new HttpError(400, "This booking cannot be paid");
-    const equipment = await col.equipment.findOne({ _id: booking.equipmentId, status: "approved" });
-    if (!equipment) throw new HttpError(404, "Equipment is no longer available");
-    const available = await getAvailableQuantity(equipment, booking.startDate, booking.endDate, booking._id);
-    if (booking.quantity > available) throw new HttpError(409, "Equipment is no longer available for these dates");
-    const session = await createCheckoutSession(booking, req.user.email, clientBase(req));
-    res.json({ checkoutUrl: session.url });
-  })
-);
-
-// Server-side payment check: asks Stripe directly (never trusts the frontend).
-// Call this from the payment success page. Works even without a webhook.
-app.post(
-  "/api/bookings/:id/verify",
-  verifyRenter,
-  wrap(async (req, res) => {
-    const booking = await col.bookings.findOne({ _id: oid(req.params.id), customerId: req.user._id });
-    if (!booking) throw new HttpError(404, "Booking not found");
-    if (booking.paymentStatus !== "paid" && booking.stripeSessionId) {
-      const session = await stripe.checkout.sessions.retrieve(booking.stripeSessionId);
-      if (session.payment_status === "paid") await markBookingPaid(session);
-    }
-    const fresh = await col.bookings.findOne({ _id: booking._id });
-    res.json({ item: fresh });
-  })
-);
-
-// Customer cancels an unpaid booking
-app.patch(
-  "/api/bookings/:id/cancel",
-  verifyRenter,
-  wrap(async (req, res) => {
-    const booking = await col.bookings.findOneAndUpdate(
-      { _id: oid(req.params.id), customerId: req.user._id, status: "pending", paymentStatus: "unpaid" },
-      { $set: { status: "cancelled" } },
-      { returnDocument: "before" }
-    );
-    if (!booking) throw new HttpError(400, "Only unpaid pending bookings can be cancelled");
-    if (booking.stripeSessionId) await stripe.checkout.sessions.expire(booking.stripeSessionId).catch(() => {});
-    res.json({ message: "Booking cancelled" });
-  })
-);
-
-// Owner marks a paid booking as completed (equipment returned)
-app.patch(
-  "/api/bookings/:id/status",
-  verifyOwner,
-  wrap(async (req, res) => {
-    if (req.body.status !== "completed") throw new HttpError(400, "Status can only be changed to 'completed'");
-    const result = await col.bookings.findOneAndUpdate(
-      { _id: oid(req.params.id), ownerId: req.user._id, status: "confirmed", paymentStatus: "paid" },
-      { $set: { status: "completed", completedAt: new Date() } },
-      { returnDocument: "after" }
-    );
-    if (!result) throw new HttpError(400, "Only your confirmed (paid) bookings can be completed");
-    res.json({ item: result });
-  })
-);
-
-// ---------------------------------------------------------------------
-// 14. ROUTES - REVIEWS
-// ---------------------------------------------------------------------
-app.get(
-  "/api/reviews",
-  wrap(async (req, res) => {
-    const limit = Math.min(parseInt(req.query.limit) || 6, 20);
-    const items = await col.reviews.find().sort({ createdAt: -1 }).limit(limit).toArray();
-    res.json({ items });
-  })
-);
-
-app.post(
-  "/api/reviews",
-  verifyRenter,
-  wrap(async (req, res) => {
-    const rating = Number(req.body.rating);
-    const comment = str(req.body.comment, 1000);
-    if (!Number.isInteger(rating) || rating < 1 || rating > 5) throw new HttpError(400, "Rating must be between 1 and 5");
-    if (!comment) throw new HttpError(400, "Comment is required");
-    const booking = await col.bookings.findOne({ _id: oid(req.body.bookingId), customerId: req.user._id, status: "completed" });
-    if (!booking) throw new HttpError(400, "You can only review your completed rentals");
-    if (await col.reviews.findOne({ bookingId: booking._id })) throw new HttpError(409, "You already reviewed this rental");
-    const review = {
-      bookingId: booking._id,
-      equipmentId: booking.equipmentId,
-      equipmentName: booking.equipmentName,
-      userId: req.user._id,
-      userName: req.user.name,
-      userPhoto: req.user.photoURL || "",
-      rating,
-      comment,
-      createdAt: new Date(),
-    };
-    review._id = (await col.reviews.insertOne(review)).insertedId;
-    res.status(201).json({ item: review });
-  })
-);
-
-// ---------------------------------------------------------------------
-// 15. ROUTES - ADMIN
-// ---------------------------------------------------------------------
-app.get(
-  "/api/admin/users",
-  verifyAdmin,
-  wrap(async (req, res) => {
-    const { page, limit, skip } = paginate(req, 10);
-    const filter = {};
-    if (ROLES.includes(req.query.role)) filter.role = req.query.role;
-    if (str(req.query.search)) {
-      const rx = { $regex: escapeRegex(str(req.query.search, 80)), $options: "i" };
-      filter.$or = [{ name: rx }, { email: rx }];
-    }
-    const [items, total] = await Promise.all([
-      col.users.find(filter, { projection: { passwordHash: 0 } }).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
-      col.users.countDocuments(filter),
-    ]);
-    res.json(pageResult(items, total, page, limit));
-  })
-);
-
-app.patch(
-  "/api/admin/users/:id/role",
-  verifyAdmin,
-  wrap(async (req, res) => {
-    const _id = oid(req.params.id);
-    const role = req.body.role;
-    if (!ROLES.includes(role)) throw new HttpError(400, "Role must be customer, owner or admin");
-    if (_id.equals(req.user._id)) throw new HttpError(400, "You cannot change your own role");
-    const result = await col.users.findOneAndUpdate({ _id }, { $set: { role } }, { returnDocument: "after", projection: { passwordHash: 0 } });
-    if (!result) throw new HttpError(404, "User not found");
-    res.json({ user: result });
-  })
-);
-
-app.get(
-  "/api/admin/equipment",
-  verifyAdmin,
-  wrap(async (req, res) => {
-    const { page, limit, skip } = paginate(req, 10);
-    const filter = {};
-    if (EQUIPMENT_STATUSES.includes(req.query.status)) filter.status = req.query.status;
-    const [items, total] = await Promise.all([
-      col.equipment.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
-      col.equipment.countDocuments(filter),
-    ]);
-    res.json(pageResult(items, total, page, limit));
-  })
-);
-
-app.patch(
-  "/api/admin/equipment/:id/status",
-  verifyAdmin,
-  wrap(async (req, res) => {
-    if (!EQUIPMENT_STATUSES.includes(req.body.status)) throw new HttpError(400, "Status must be pending, approved or rejected");
-    const result = await col.equipment.findOneAndUpdate(
-      { _id: oid(req.params.id) },
-      { $set: { status: req.body.status, updatedAt: new Date() } },
-      { returnDocument: "after" }
-    );
-    if (!result) throw new HttpError(404, "Equipment not found");
-    res.json({ item: result });
-  })
-);
-
-app.get(
-  "/api/admin/bookings",
-  verifyAdmin,
-  wrap(async (req, res) => {
-    const { page, limit, skip } = paginate(req, 10);
-    const [items, total] = await Promise.all([
-      col.bookings.find().sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
-      col.bookings.countDocuments(),
-    ]);
-    res.json(pageResult(items, total, page, limit));
-  })
-);
-
-// ---------------------------------------------------------------------
-// 16. ROUTES - DASHBOARD ANALYTICS (real MongoDB aggregations)
-// ---------------------------------------------------------------------
-const monthKey = (field) => ({ $dateToString: { format: "%Y-%m", date: field } });
-
-app.get(
-  "/api/stats/admin",
-  verifyAdmin,
-  wrap(async (req, res) => {
-    const [totalUsers, totalEquipment, totalBookings, pendingApprovals, completedRentals, revenue, monthlyBookings, usersByRole] =
-      await Promise.all([
-        col.users.countDocuments(),
-        col.equipment.countDocuments(),
-        col.bookings.countDocuments(),
-        col.equipment.countDocuments({ status: "pending" }),
-        col.bookings.countDocuments({ status: "completed" }),
-        col.payments.aggregate([{ $group: { _id: null, total: { $sum: "$amount" } } }]).toArray(),
-        col.bookings
-          .aggregate([
-            { $group: { _id: monthKey("$createdAt"), bookings: { $sum: 1 } } },
-            { $sort: { _id: -1 } },
-            { $limit: 12 },
-            { $sort: { _id: 1 } },
-            { $project: { _id: 0, month: "$_id", bookings: 1 } },
-          ])
-          .toArray(),
-        col.users.aggregate([{ $group: { _id: "$role", count: { $sum: 1 } } }, { $project: { _id: 0, role: "$_id", count: 1 } }]).toArray(),
-      ]);
-    res.json({
-      totalUsers,
-      totalEquipment,
-      totalBookings,
-      pendingApprovals,
-      completedRentals,
-      totalRevenue: money(revenue[0]?.total || 0),
-      monthlyBookings,
-      usersByRole,
-    });
-  })
-);
-
-app.get(
-  "/api/stats/owner",
-  verifyOwner,
-  wrap(async (req, res) => {
-    const ownerId = req.user._id;
-    const [totalListed, completedRentals, earnings, monthlyEarnings] = await Promise.all([
-      col.equipment.countDocuments({ ownerId }),
-      col.bookings.countDocuments({ ownerId, status: "completed" }),
-      col.payments.aggregate([{ $match: { ownerId } }, { $group: { _id: null, total: { $sum: "$amount" } } }]).toArray(),
-      col.payments
-        .aggregate([
-          { $match: { ownerId } },
-          { $group: { _id: monthKey("$createdAt"), earnings: { $sum: "$amount" } } },
-          { $sort: { _id: -1 } },
-          { $limit: 12 },
-          { $sort: { _id: 1 } },
-          { $project: { _id: 0, month: "$_id", earnings: { $round: ["$earnings", 2] } } },
-        ])
-        .toArray(),
-    ]);
-    res.json({ totalListed, completedRentals, totalEarnings: money(earnings[0]?.total || 0), monthlyEarnings });
-  })
-);
-
-app.get(
-  "/api/stats/customer",
-  verifyRenter,
-  wrap(async (req, res) => {
-    const customerId = req.user._id;
-    const [totalRentals, activeRentals, completedRentals, favorites, spent] = await Promise.all([
-      col.bookings.countDocuments({ customerId }),
-      col.bookings.countDocuments({ customerId, status: "confirmed" }),
-      col.bookings.countDocuments({ customerId, status: "completed" }),
-      col.favorites.countDocuments({ userId: customerId }),
-      col.payments.aggregate([{ $match: { customerId } }, { $group: { _id: null, total: { $sum: "$amount" } } }]).toArray(),
-    ]);
-    res.json({ totalRentals, activeRentals, completedRentals, favorites, totalSpent: money(spent[0]?.total || 0) });
-  })
-);
-
-// ---------------------------------------------------------------------
-// 17. 404 + ERROR HANDLER
-// ---------------------------------------------------------------------
-app.use((req, res) => res.status(404).json({ message: `Route not found: ${req.method} ${req.originalUrl}` }));
-
-app.use((err, req, res, next) => {
-  if (err.type === "entity.parse.failed") return res.status(400).json({ message: "Invalid JSON body" });
-  if (err.type === "entity.too.large") return res.status(413).json({ message: "Request body too large" });
-  const status = err.status || 500;
-  if (status >= 500) console.error(err);
-  res.status(status).json({ message: status >= 500 && !(err instanceof HttpError) ? "Internal server error" : err.message });
+app.use((_req, _res, next) => next(new HttpError(404, 'The requested API route was not found.')));
+app.use((error, _req, res, _next) => {
+  if (error.code === 11000) return res.status(409).json({ message: 'This record already exists.' });
+  const status = Number(error.status) || 500;
+  if (status >= 500) console.error('API error:', error.message);
+  res.status(status).json({ message: status >= 500 ? 'The server could not complete the request.' : error.message });
 });
 
-// ---------------------------------------------------------------------
-// 18. START
-// ---------------------------------------------------------------------
-connectDB()
-  .then(() => app.listen(PORT, () => console.log(`Server running on port ${PORT}`)))
-  .catch((err) => {
-    console.error("Failed to start server:", err.message);
-    process.exit(1);
+function createAuth(db) {
+  const googleClientId = process.env.GOOGLE_CLIENT_ID;
+  const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET;
+  return betterAuth({
+    appName: 'RentGear',
+    baseURL: authBaseUrl,
+    basePath: '/api/auth',
+    secret: betterAuthSecret,
+    trustedOrigins: clientOrigins,
+    database: mongodbAdapter(db, { client: mongo }),
+    emailAndPassword: {
+      enabled: true,
+      minPasswordLength: 6,
+      maxPasswordLength: 128,
+      requireEmailVerification: false,
+      password: {
+        hash: async (password) => {
+          if (!validPassword(password)) {
+            throw new APIError('BAD_REQUEST', {
+              message: 'Password must include uppercase and lowercase letters and be at least 6 characters.',
+            });
+          }
+          return bcrypt.hash(password, 12);
+        },
+        verify: ({ hash, password }) => bcrypt.compare(password, hash),
+      },
+    },
+    ...(googleClientId && googleClientSecret ? {
+      socialProviders: {
+        google: { clientId: googleClientId, clientSecret: googleClientSecret },
+      },
+    } : {}),
+    account: {
+      accountLinking: {
+        enabled: true,
+        trustedProviders: ['google'],
+        requireLocalEmailVerified: false,
+      },
+    },
+    user: {
+      modelName: 'users',
+      fields: { image: 'photoURL' },
+      additionalFields: {
+        role: { type: 'string', required: false, defaultValue: 'customer', input: true },
+        phone: { type: 'string', required: false, defaultValue: '', input: false },
+        address: { type: 'string', required: false, defaultValue: '', input: false },
+      },
+    },
+    databaseHooks: {
+      user: {
+        create: {
+          before: async (user, context) => {
+            const email = String(user.email || '').trim().toLowerCase();
+            const signupRole = context?.getHeader('x-signup-role');
+            const isGoogleSignup = context?.path?.endsWith('/one-tap/callback');
+            if (isGoogleSignup && signupRole !== 'customer' && signupRole !== 'owner') {
+              throw new APIError('BAD_REQUEST', {
+                message: 'Choose a customer or equipment owner role on the sign-up page before using Google sign-up.',
+              });
+            }
+            const requestedRole = user.role === 'owner' || signupRole === 'owner' ? 'owner' : 'customer';
+            return {
+              data: {
+                ...user,
+                email,
+                role: adminEmails.has(email) ? 'admin' : requestedRole,
+                phone: typeof user.phone === 'string' ? user.phone : '',
+                address: typeof user.address === 'string' ? user.address : '',
+              },
+            };
+          },
+        },
+        update: {
+          before: async (user) => {
+            const { role: _role, ...safeUser } = user;
+            return { data: safeUser };
+          },
+        },
+      },
+    },
+    plugins: [
+      betterAuthJwt(),
+      ...(googleClientId ? [oneTap({ clientId: googleClientId })] : []),
+    ],
   });
+}
+
+async function migrateLegacyPasswordAccounts(accountCollection) {
+  await accountCollection.createIndex({ userId: 1, providerId: 1 });
+  await users.updateMany(
+    { provider: 'google', emailVerified: { $ne: true } },
+    { $set: { emailVerified: true } },
+  );
+  const legacyUsers = users.find({ passwordHash: { $type: 'string' } });
+  for await (const user of legacyUsers) {
+    await accountCollection.updateOne(
+      { userId: user._id, providerId: 'credential' },
+      {
+        $setOnInsert: {
+          accountId: asId(user._id),
+          providerId: 'credential',
+          userId: user._id,
+          password: user.passwordHash,
+          createdAt: user.createdAt || now(),
+          updatedAt: user.updatedAt || now(),
+        },
+      },
+      { upsert: true },
+    );
+  }
+}
+
+async function start() {
+  await mongo.connect();
+  const db = mongo.db(dbName);
+  users = db.collection('users'); equipment = db.collection('equipment'); bookings = db.collection('bookings');
+  payments = db.collection('payments'); favorites = db.collection('favorites'); reviews = db.collection('reviews');
+  const auth = createAuth(db);
+  betterAuthHandler = toNodeHandler(auth);
+  await Promise.all([
+    users.createIndex({ email: 1 }, { unique: true }),
+    equipment.createIndex({ status: 1, createdAt: -1 }), equipment.createIndex({ ownerId: 1, createdAt: -1 }),
+    bookings.createIndex({ customerId: 1, createdAt: -1 }), bookings.createIndex({ ownerId: 1, createdAt: -1 }),
+    bookings.createIndex({ equipmentId: 1, startDate: 1, endDate: 1, status: 1 }), bookings.createIndex({ stripeSessionId: 1 }, { sparse: true }),
+    payments.createIndex({ stripeSessionId: 1 }, { unique: true, sparse: true }), payments.createIndex({ ownerId: 1, status: 1, createdAt: -1 }), favorites.createIndex({ userId: 1, equipmentId: 1 }, { unique: true }),
+    reviews.createIndex({ bookingId: 1 }, { unique: true, sparse: true }), reviews.createIndex({ equipmentId: 1, createdAt: -1 }),
+  ]);
+  await migrateLegacyPasswordAccounts(db.collection('account'));
+  const expiryTimer = setInterval(async () => {
+    try {
+      const today = new Date().toISOString().slice(0, 10);
+      await Promise.all([
+        bookings.updateMany(
+          { status: 'pending', paymentStatus: 'unpaid', holdUntil: { $lte: now() } },
+          { $set: { status: 'cancelled', paymentStatus: 'expired' } },
+        ),
+        bookings.updateMany(
+          { status: 'confirmed', paymentStatus: 'paid', endDate: { $lt: today } },
+          { $set: { status: 'completed', completedAt: now() } },
+        ),
+      ]);
+    } catch (error) {
+      console.error('Could not refresh expired rental statuses:', error.message);
+    }
+  }, 60_000);
+  expiryTimer.unref();
+  app.listen(port, () => {
+    console.log(`Server is running on port number ${port}`);
+    console.log('MongoDB connection successful');
+  });
+}
+
+start().catch((error) => { console.error('Could not start RentGear API:', error.message); process.exit(1); });
+
+process.on('SIGINT', async () => { await mongo.close(); process.exit(0); });
+process.on('SIGTERM', async () => { await mongo.close(); process.exit(0); });
