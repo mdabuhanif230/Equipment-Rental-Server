@@ -1,4 +1,7 @@
 import 'dotenv/config';
+import dotenv from 'dotenv';
+// dotenv/config only reads `.env`; also support `.env.local` when that's the file in use.
+dotenv.config({ path: '.env.local' });
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -29,13 +32,14 @@ app.use((_req, res, next) => {
 const port = Number(process.env.PORT || 5000);
 const dbName = process.env.DB_NAME || 'rentgear';
 const jwtSecret = process.env.JWT_SECRET;
-const authBaseUrl = (process.env.BETTER_AUTH_URL || `http://localhost:${port}`).replace(/\/$/, '');
+const vercelUrl = process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : '';
+const authBaseUrl = (process.env.BETTER_AUTH_URL || vercelUrl || `http://localhost:${port}`).replace(/\/$/, '');
 const betterAuthSecret = process.env.BETTER_AUTH_SECRET;
 const stripeKey = process.env.STRIPE_SECRET_KEY || '';
 const stripe = /^(?:sk|rk)_(?:test|live)_[A-Za-z0-9]+$/.test(stripeKey) && !/^(?:sk|rk)_(?:test|live)_x+$/i.test(stripeKey)
   ? new Stripe(stripeKey)
   : null;
-const clientOrigins = (process.env.CLIENT_URLS || 'http://localhost:3000')
+const clientOrigins = (process.env.CLIENT_URLS || process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000')
   .split(',').map((value) => value.trim()).filter(Boolean);
 const adminEmails = new Set((process.env.ADMIN_EMAILS || '').split(',').map((x) => x.trim().toLowerCase()).filter(Boolean));
 const betterAuthJwks = createRemoteJWKSet(new URL(`${authBaseUrl}/api/auth/jwks`));
@@ -104,7 +108,7 @@ const sendEmail = async (to, subject, html) => {
   const key = process.env.RESEND_API_KEY;
   if (!key || !to) return;
   try {
-    await fetch('https://api.resend.com/emails', {
+    const response = await fetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -112,6 +116,9 @@ const sendEmail = async (to, subject, html) => {
         to, subject, html,
       }),
     });
+    if (!response.ok) {
+      console.error('Resend rejected notification email:', response.status, await response.text());
+    }
   } catch (error) {
     console.error('Could not send notification email:', error.message);
   }

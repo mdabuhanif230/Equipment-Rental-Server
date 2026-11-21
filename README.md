@@ -7,8 +7,16 @@ with equipment owners and provides listing moderation, date-aware reservations, 
 and role-specific dashboards.
 
 - **Purpose:** secure API for the RentGear equipment rental platform.
-- **Live API URL:** _Not deployed yet — add the production API URL after deployment._
+- **Live API URL:** https://equipment-rental-server-two.vercel.app
+- **Live client URL:** https://equipment-rental-client-nine.vercel.app
 - **Client project:** `../equipment-rental-client`
+
+### Submission details (Assignment 9 — Category 003)
+- **Admin Email:** `mhabuhanif230@gmail.com`
+- **Admin Password:** `Hanif15387126` _(demo credential for evaluator only)_
+- **Live Site Link:** https://equipment-rental-client-nine.vercel.app
+- **GitHub Repository (server):** https://github.com/mdabuhanif230/Equipment-Rental-Server
+- **GitHub Repository (client):** https://github.com/mdabuhanif230/-Equipment-Rental-Client-
 
 ## Features
 
