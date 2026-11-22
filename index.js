@@ -272,8 +272,9 @@ async function createCheckout(booking) {
 }
 
 // Stripe requires the unparsed request body for signature verification.
-app.post('/api/payments/webhook', express.raw({ type: 'application/json' }), route(async (req, res) => {
+const stripeWebhookHandler = route(async (req, res) => {
   if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) fail(503, 'Payment webhooks are not configured.');
+  if (!/^whsec_/.test(process.env.STRIPE_WEBHOOK_SECRET)) fail(503, 'The Stripe webhook secret is invalid. Configure a whsec_... signing secret.');
   let event;
   try { event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], process.env.STRIPE_WEBHOOK_SECRET); }
   catch { fail(400, 'Invalid Stripe webhook signature.'); }
@@ -290,7 +291,9 @@ app.post('/api/payments/webhook', express.raw({ type: 'application/json' }), rou
     await bookings.updateOne({ stripeSessionId: session.id, paymentStatus: 'unpaid', status: 'pending' }, { $set: { paymentStatus: 'expired', status: 'cancelled' } });
   }
   res.json({ received: true });
-}));
+});
+app.post('/api/payments/webhook', express.raw({ type: 'application/json' }), stripeWebhookHandler);
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), stripeWebhookHandler);
 
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(cors({ origin(origin, callback) {
