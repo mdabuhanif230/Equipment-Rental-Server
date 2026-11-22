@@ -377,7 +377,8 @@ app.post('/api/auth/local/refresh', route(async (req, res) => {
 }));
 
 app.post('/api/auth/google/callback', route(async (req, res) => {
-  const googleClientId = process.env.GOOGLE_CLIENT_ID;
+  const googleClientId = process.env.GOOGLE_CLIENT_ID ||
+    '149283216581-vjliqf2ebqkaqqu5mhrsf435uk8hfep8.apps.googleusercontent.com';
   if (!googleClientId) fail(503, 'Google sign-in is not configured.');
   const idToken = String(req.body.idToken || '');
   if (!idToken) fail(400, 'Google sign-in token is required.');
@@ -856,7 +857,8 @@ app.use((error, _req, res, _next) => {
 });
 
 function createAuth(db) {
-  const googleClientId = process.env.GOOGLE_CLIENT_ID;
+  const googleClientId = process.env.GOOGLE_CLIENT_ID ||
+    '149283216581-vjliqf2ebqkaqqu5mhrsf435uk8hfep8.apps.googleusercontent.com';
   const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET;
   return betterAuth({
     appName: 'RentGear',
