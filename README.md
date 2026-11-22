@@ -1,97 +1,266 @@
-# Equipment Rental Platform — RentGear Server
+# Equipment Rental Platform - RentGear API
 
-## Project
+This repository contains the Express/MongoDB backend for the RentGear equipment rental
+marketplace. It provides authentication, role authorization, equipment management, availability
+checks, favorites, reviews, bookings, Stripe Checkout, analytics, and administrative operations.
 
-RentGear is the backend REST API for an equipment-rental marketplace. It connects customers
-with equipment owners and provides listing moderation, date-aware reservations, Stripe Checkout,
-and role-specific dashboards.
+## Live Project
 
-- **Purpose:** secure API for the RentGear equipment rental platform.
-- **Live API URL:** https://equipment-rental-server-two.vercel.app
-- **Live client URL:** https://equipment-rental-client-nine.vercel.app
-- **Client project:** `../equipment-rental-client`
+- **Live API:** https://equipment-rental-server.onrender.com
+- **API Health:** https://equipment-rental-server.onrender.com/api/health
+- **Live Client:** https://rentgear-ivory.vercel.app
+- **Server Repository:** https://github.com/mdabuhanif230/Equipment-Rental-Server
+- **Client Repository:** https://github.com/mdabuhanif230/Equipment-Rental-Client
 
-### Submission details (Assignment 9 — Category 003)
-- **Admin Email:** `mhabuhanif230@gmail.com`
-- **Admin Password:** `Hanif15387126` _(demo credential for evaluator only)_
-- **Live Site Link:** https://equipment-rental-client-nine.vercel.app
-- **GitHub Repository (server):** https://github.com/mdabuhanif230/Equipment-Rental-Server
-- **GitHub Repository (client):** https://github.com/mdabuhanif230/-Equipment-Rental-Client-
+## Assignment Submission
+
+| Item | Details |
+| --- | --- |
+| Project | RentGear - Equipment Rental Platform |
+| Assignment | Assignment 9 - Category 003 |
+| Admin Email | `mhabuhanif230@gmail.com` |
+| Admin Password | `Hanif15387126` |
+| Live API | https://equipment-rental-server.onrender.com |
+| Live Site | https://rentgear-ivory.vercel.app |
 
 ## Features
 
-- Better Auth email/password and Google authentication with JWTs for protected API requests.
-- Customer, owner, and admin authorization middleware.
-- Equipment search, filtering, sorting, pagination, favorites, and reviews.
-- Owner listings, admin approvals, bookings, and availability checks.
-- Stripe Checkout, verified payment records, and booking status updates.
-- Admin and owner dashboard analytics.
-- Admin user management: role changes plus suspend/restore (suspended accounts are rejected by `verifyToken`).
-- `node-cron` job that expires unpaid holds and completes rentals after their end date.
-- Optional Resend email notifications to renters and owners when a rental is completed.
-- Idempotent `npm run seed` script for demo equipment and homepage reviews.
+### Authentication
 
-## Run
+- Email/password registration and sign-in
+- Better Auth MongoDB adapter
+- Password validation and bcrypt hashing
+- Google ID-token verification
+- JWT bearer tokens for protected REST requests
+- Secure customer, owner, and admin route authorization
+- Legacy password-account migration
+
+### Equipment
+
+- Approved equipment catalogue
+- Featured and category endpoints
+- Server-side name/location search
+- Category, rental type, price, availability, and sorting filters
+- Pagination
+- Live date-and-quantity availability calculation
+- Owner listing creation and updates
+- Admin approval and rejection
+- ImgBB and direct image URL support
+
+### Customer
+
+- Favorites stored in MongoDB
+- Rental booking creation
+- 35-minute booking hold
+- Completed-rental review restrictions
+- Customer rental and spending analytics
+
+### Owner
+
+- Owner-specific equipment inventory
+- Owner rental history
+- Completed-rental and earnings analytics
+- Monthly earnings aggregation
+
+### Admin
+
+- User search and role filtering
+- Customer, owner, and admin role changes
+- Account suspend and restore
+- Platform-wide equipment moderation
+- Platform-wide booking management
+- User, equipment, booking, revenue, and monthly statistics
+
+### Payments and Automation
+
+- Stripe Checkout sessions
+- Stripe test-mode support
+- Server-side payment verification
+- `payments` collection transaction records
+- `checkout.session.completed` and async success webhook handling
+- Booking hold expiration
+- Automatic rental completion after end date
+- Optional Resend notification emails
+
+## Technology Stack
+
+| Area | Package |
+| --- | --- |
+| Server | Express.js |
+| Database | MongoDB and MongoDB Atlas |
+| Authentication | Better Auth |
+| Password Security | bcryptjs |
+| JWT | jsonwebtoken and jose |
+| Payment | Stripe |
+| Scheduling | node-cron |
+| Security | Helmet and CORS |
+| Configuration | dotenv |
+
+## Local Setup
+
+Requirements:
+
+- Node.js 20 or newer
+- MongoDB or MongoDB Atlas
+- Stripe test account
+- Google OAuth Web Client ID, if Google login is required
+
 ```bash
 npm install
-# copy .env.example to .env and configure it
+cp .env.example .env.local
 npm run dev
-# optional: populate an empty database with demo equipment and reviews
-npm run seed
 ```
 
-## Setup
-Copy `.env.example` to `.env` and set MongoDB, `JWT_SECRET`, `BETTER_AUTH_URL`,
-`BETTER_AUTH_SECRET`, and Stripe values. Use separate random values for the two secrets.
-MongoDB credentials are read only from environment variables; the server does not contain a
-database password or hard-coded cluster host. Set `DB_NAME` to `equipment_rental` (or your
-preferred database name).
+The API runs at `http://localhost:5000` by default.
 
-Set `CLIENT_URLS` to a comma-separated list of allowed frontend origins. For Google login, set
-the same OAuth Web Client ID in the server's `GOOGLE_CLIENT_ID` and the client's
-`NEXT_PUBLIC_GOOGLE_CLIENT_ID`. The ID-token sign-in flow does not require a Google client secret;
-if configured, `GOOGLE_CLIENT_SECRET` remains server-side and enables OAuth provider configuration.
-New users choose either customer or equipment-owner access during sign-up. The first admin can be
-created by adding that email to `ADMIN_EMAILS` before registration, or by promoting an account
-directly in MongoDB.
+## Environment Variables
 
-The client defaults to `http://localhost:5000/api`. Start the API with `npm run dev` and the client with `npm run dev` from its own directory. The API expires abandoned checkout holds and marks paid rentals completed after their end date once per minute.
+Create `.env.local` from `.env.example`.
 
-## Server structure
+| Variable | Purpose |
+| --- | --- |
+| `PORT` | Express listening port |
+| `MONGODB_URI` | MongoDB Atlas or local MongoDB connection string |
+| `DB_NAME` | MongoDB database name |
+| `JWT_SECRET` | Bearer access-token signing secret |
+| `BETTER_AUTH_URL` | Public authentication base URL |
+| `BETTER_AUTH_SECRET` | Better Auth signing secret |
+| `CLIENT_URLS` | Comma-separated allowed client origins |
+| `NEXT_PUBLIC_SITE_URL` | Main client URL used for payment return links |
+| `GOOGLE_CLIENT_ID` | Google OAuth Web Client ID |
+| `GOOGLE_CLIENT_SECRET` | Optional OAuth server credential |
+| `ADMIN_EMAILS` | Comma-separated first-admin emails |
+| `STRIPE_SECRET_KEY` | Stripe secret key |
+| `STRIPE_WEBHOOK_SECRET` | Stripe `whsec_...` webhook signing secret |
+| `RESEND_API_KEY` | Optional Resend API key |
+| `EMAIL_FROM` | Optional sender address |
 
-The backend is intentionally kept in `index.js`, like the supplied reference server, so the complete
-request flow is easy to follow in one file. It is organized into sections for configuration and
-helpers, authentication, equipment, favorites, bookings and payments, admin operations, reviews,
-analytics, error handling, and startup/database indexes.
+Do not commit `.env.local`, database credentials, JWT secrets, OAuth secrets, or Stripe secrets.
 
-## Packages
+## Stripe Configuration
 
-Runtime: `express`, `cors`, `helmet`, `dotenv`, `mongodb`, `better-auth`,
-`@better-auth/mongo-adapter`, `bcryptjs`, `jose`, `jsonwebtoken`, `node-cron`, and `stripe`.
-Development: `nodemon`.
+Create a Stripe webhook endpoint pointing to:
 
-## Stripe webhook (optional, recommended for production)
+```text
+https://equipment-rental-server.onrender.com/api/stripe/webhook
+```
+
+Enable these events:
+
+- `checkout.session.completed`
+- `checkout.session.async_payment_succeeded`
+- `checkout.session.expired`
+
+Store the generated signing secret in `STRIPE_WEBHOOK_SECRET`. The local equivalent is:
+
+```text
+http://localhost:5000/api/stripe/webhook
+```
+
+Test cards:
+
+| Field | Value |
+| --- | --- |
+| Card | `4242 4242 4242 4242` |
+| Expiry | Any future date |
+| CVC | Any three digits |
+| ZIP | Any five digits |
+
+## API Overview
+
+### Authentication
+
+| Method | Endpoint | Access |
+| --- | --- | --- |
+| POST | `/api/auth/local/sign-up` | Public |
+| POST | `/api/auth/local/sign-in` | Public |
+| POST | `/api/auth/local/refresh` | Bearer token |
+| POST | `/api/auth/google/callback` | Public |
+| GET | `/api/auth/get-session` | Session |
+| GET | `/api/auth/token` | Session |
+| GET | `/api/users/me` | Authenticated |
+| PATCH | `/api/users/me` | Authenticated |
+
+### Equipment
+
+| Method | Endpoint | Access |
+| --- | --- | --- |
+| GET | `/api/equipment/featured` | Public |
+| GET | `/api/equipment/categories` | Public |
+| GET | `/api/equipment` | Public |
+| GET | `/api/equipment/:id` | Public/owner/admin-aware |
+| GET | `/api/equipment/:id/availability` | Public |
+| POST | `/api/equipment` | Owner |
+| PUT | `/api/equipment/:id` | Owner |
+| DELETE | `/api/equipment/:id` | Owner/admin |
+
+Public equipment filtering parameters:
+
+```text
+search, location, category, rentalType, minPrice, maxPrice,
+available, sort, page, limit
+```
+
+Sorting values:
+
+- `newest`
+- `price_asc`
+- `price_desc`
+
+### Customer
+
+| Method | Endpoint | Access |
+| --- | --- | --- |
+| GET | `/api/favorites/ids` | Customer |
+| GET | `/api/favorites` | Customer |
+| POST | `/api/favorites/:id` | Customer |
+| DELETE | `/api/favorites/:id` | Customer |
+| GET | `/api/bookings/my` | Customer |
+| POST | `/api/bookings` | Customer |
+| POST | `/api/bookings/:id/pay` | Customer |
+| PATCH | `/api/bookings/:id/cancel` | Customer |
+| POST | `/api/bookings/:id/verify` | Customer |
+| POST | `/api/reviews` | Customer |
+| GET | `/api/stats/customer` | Customer |
+
+### Owner
+
+| Method | Endpoint | Access |
+| --- | --- | --- |
+| GET | `/api/owner/equipment` | Owner |
+| GET | `/api/bookings/owner` | Owner |
+| PATCH | `/api/bookings/:id/status` | Owner |
+| GET | `/api/stats/owner` | Owner |
+
+### Admin
+
+| Method | Endpoint | Access |
+| --- | --- | --- |
+| GET | `/api/admin/users` | Admin |
+| PATCH | `/api/admin/users/:id/role` | Admin |
+| PATCH | `/api/admin/users/:id/ban` | Admin |
+| GET | `/api/admin/equipment` | Admin |
+| PATCH | `/api/admin/equipment/:id/status` | Admin |
+| PUT | `/api/admin/equipment/:id` | Admin |
+| DELETE | `/api/admin/equipment/:id` | Admin |
+| GET | `/api/admin/bookings` | Admin |
+| PATCH | `/api/admin/bookings/:id/status` | Admin |
+| GET | `/api/stats/admin` | Admin |
+
+## Scripts
+
 ```bash
-stripe listen --forward-to localhost:5000/api/payments/webhook
+npm run dev
+npm start
+npm run seed
+node --check index.js
 ```
-Copy the `whsec_...` value into `STRIPE_WEBHOOK_SECRET`. The payment success page also verifies Checkout directly with Stripe, so local testing still works without a webhook listener.
 
-## API overview
-- Auth: Better Auth endpoints under `/api/auth` (`/sign-up/email`, `/sign-in/email`,
-  `/one-tap/callback`, `/sign-in/social`, `/get-session`, `/token`); authenticated profile:
-  `/api/users/me`
-- Equipment: `/api/equipment`, `/api/equipment/featured`, `/api/equipment/categories`,
-  `/api/equipment/:id`, `/api/equipment/:id/availability`
-- Customer: `/api/favorites`, `/api/bookings/my`, `/api/stats/customer`
-- Owner: `/api/owner/equipment`, `/api/bookings/owner`, `/api/stats/owner`
-- Admin: `/api/admin/users` (role + suspend/restore), `/api/admin/equipment`, `/api/admin/bookings`,
-  `/api/admin/bookings/:id/status`, `/api/stats/admin`
-- Payments: `/api/bookings` (Stripe checkout), `/api/payments/webhook`
-- Reviews: `/api/reviews`
+## Project Structure
 
-The protected API uses Better Auth's JWT plugin together with `verifyToken`, `verifyRenter`,
-`verifyOwner`, and `verifyAdmin`. On first startup, existing bcrypt password hashes are copied
-into Better Auth credential accounts so current email/password accounts can continue signing in.
-Public
-equipment search supports `search`, `location`, `category`, `rentalType`, `minPrice`, `maxPrice`,
-`available`, `sort`, `page`, and `limit`.
+```text
+index.js       Express app, routes, middleware, jobs, and startup
+.env.example   Environment variable template
+package.json   Dependencies and npm scripts
+README.md      API documentation
+```
