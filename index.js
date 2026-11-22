@@ -690,7 +690,11 @@ app.post('/api/bookings', verifyToken, verifyRenter, route(async (req, res) => {
       booking._id = inserted.insertedId;
     });
     const checkout = await createCheckout(booking);
-    res.status(201).json({ bookingId: asId(booking._id), checkoutUrl: checkout.url });
+    res.status(201).json({
+      bookingId: asId(booking._id),
+      checkoutUrl: checkout.url,
+      testMode: stripeKey.startsWith('sk_test_') || stripeKey.startsWith('rk_test_'),
+    });
   } catch (error) {
     if (booking._id) await bookings.deleteOne({ _id: booking._id, paymentStatus: 'unpaid' });
     throw error;
