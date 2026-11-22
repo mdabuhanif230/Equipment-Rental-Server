@@ -49,6 +49,7 @@ const clientOrigins = [...new Set([
 ])];
 const adminEmails = new Set((process.env.ADMIN_EMAILS || '').split(',').map((x) => x.trim().toLowerCase()).filter(Boolean));
 const betterAuthJwks = createRemoteJWKSet(new URL(`${authBaseUrl}/api/auth/jwks`));
+const googleJwks = createRemoteJWKSet(new URL('https://www.googleapis.com/oauth2/v3/certs'));
 
 if (!jwtSecret || jwtSecret.length < 32) {
   throw new Error('JWT_SECRET must be set to a random value with at least 32 characters.');
@@ -296,13 +297,136 @@ app.use(cors({ origin(origin, callback) {
   if (!origin || clientOrigins.includes(origin)) return callback(null, true);
   return callback(new HttpError(403, 'This site is not allowed to access the API.'));
 }, credentials: true }));
+app.use(express.json({ limit: '1mb' }));
+app.get('/', (_req, res) => res.json({ name: 'RentGear API', status: 'ok' }));
+app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
+
+const issueLocalToken = (user) => jwt.sign(
+  { sub: String(user._id), email: user.email, role: user.role },
+  jwtSecret,
+  { issuer: 'rentgear-api', audience: 'rentgear-client', expiresIn: '7d' },
+);
+
+app.post('/api/auth/local/sign-in', route(async (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const password = String(req.body.password || '');
+  if (!email || !password) fail(400, 'Email and password are required.');
+  const user = await users.findOne({ email });
+  if (!user) fail(401, 'Email or password is incorrect.');
+  const account = await mongo.db(dbName).collection('account').findOne({
+    userId: user._id,
+    providerId: 'credential',
+  });
+  const passwordHash = account?.password || user.passwordHash;
+  if (!passwordHash || !(await bcrypt.compare(password, passwordHash))) {
+    fail(401, 'Email or password is incorrect.');
+  }
+  res.json({ token: issueLocalToken(user), user: publicUser(user) });
+}));
+
+app.post('/api/auth/local/sign-up', route(async (req, res) => {
+  const name = String(req.body.name || '').trim();
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const password = String(req.body.password || '');
+  const requestedRole = req.body.role === 'owner' ? 'owner' : 'customer';
+  if (!name) fail(400, 'Name is required.');
+  if (!email) fail(400, 'Email is required.');
+  const problem = validPassword(password) ? null : 'Password must include uppercase and lowercase letters and be at least 6 characters.';
+  if (problem) fail(400, problem);
+  if (await users.findOne({ email })) fail(409, 'An account with this email already exists.');
+  const timestamp = now();
+  const user = {
+    name,
+    email,
+    role: adminEmails.has(email) ? 'admin' : requestedRole,
+    photoURL: typeof req.body.photoURL === 'string' ? req.body.photoURL : '',
+    phone: '',
+    address: '',
+    emailVerified: false,
+    banned: false,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+  const inserted = await users.insertOne(user);
+  user._id = inserted.insertedId;
+  await mongo.db(dbName).collection('account').insertOne({
+    accountId: String(inserted.insertedId),
+    providerId: 'credential',
+    userId: inserted.insertedId,
+    password: await bcrypt.hash(password, 12),
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  });
+  res.status(201).json({ token: issueLocalToken(user), user: publicUser(user) });
+}));
+
+app.post('/api/auth/local/refresh', route(async (req, res) => {
+  const value = req.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
+  if (!value) fail(401, 'Please sign in to continue.');
+  let payload;
+  try {
+    payload = jwt.verify(value, jwtSecret, { issuer: 'rentgear-api', audience: 'rentgear-client' });
+  } catch {
+    fail(401, 'Your session has expired. Please sign in again.');
+  }
+  const userId = idOf(payload.sub);
+  const user = userId ? await users.findOne({ _id: userId }) : null;
+  if (!user) fail(401, 'Your account could not be found. Please sign in again.');
+  if (user.banned) fail(403, 'This account has been suspended by an administrator.');
+  res.json({ token: issueLocalToken(user) });
+}));
+
+app.post('/api/auth/google/callback', route(async (req, res) => {
+  const googleClientId = process.env.GOOGLE_CLIENT_ID;
+  if (!googleClientId) fail(503, 'Google sign-in is not configured.');
+  const idToken = String(req.body.idToken || '');
+  if (!idToken) fail(400, 'Google sign-in token is required.');
+  let payload;
+  try {
+    ({ payload } = await jwtVerify(idToken, googleJwks, {
+      issuer: ['accounts.google.com', 'https://accounts.google.com'],
+      audience: googleClientId,
+    }));
+  } catch {
+    fail(401, 'Google sign-in could not be verified.');
+  }
+  const googleId = String(payload.sub || '');
+  const email = String(payload.email || '').trim().toLowerCase();
+  if (!googleId || !email) fail(400, 'Google did not provide an account email.');
+  let user = await users.findOne({ email });
+  const timestamp = now();
+  if (!user) {
+    const signupRole = req.headers['x-signup-role'];
+    if (signupRole !== 'customer' && signupRole !== 'owner') {
+      fail(400, 'Choose a customer or equipment owner role before using Google sign-up.');
+    }
+    const inserted = await users.insertOne({
+      name: String(payload.name || email.split('@')[0]).trim(),
+      email,
+      role: adminEmails.has(email) ? 'admin' : signupRole,
+      photoURL: typeof payload.picture === 'string' ? payload.picture : '',
+      phone: '',
+      address: '',
+      emailVerified: payload.email_verified === true,
+      banned: false,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    });
+    user = await users.findOne({ _id: inserted.insertedId });
+    await mongo.db(dbName).collection('account').updateOne(
+      { providerId: 'google', accountId: googleId },
+      { $setOnInsert: { providerId: 'google', accountId: googleId, userId: user._id, createdAt: timestamp, updatedAt: timestamp } },
+      { upsert: true },
+    );
+  }
+  if (user.banned) fail(403, 'This account has been suspended by an administrator.');
+  res.json({ token: issueLocalToken(user), user: publicUser(user) });
+}));
+
 app.all('/api/auth/*', (req, res, next) => {
   if (!betterAuthHandler) return next(new HttpError(503, 'Authentication is still starting.'));
   betterAuthHandler(req, res).catch(next);
 });
-app.use(express.json({ limit: '1mb' }));
-app.get('/', (_req, res) => res.json({ name: 'RentGear API', status: 'ok' }));
-app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
 
 // ---------------- Profile ----------------
 app.get('/api/users/me', verifyToken, route(async (req, res) => res.json({ user: publicUser(req.user) })));
