@@ -174,10 +174,28 @@ const verifyAdmin = requireRole('admin');
 function validPassword(password) {
   return typeof password === 'string' && password.length >= 6 && /[a-z]/.test(password) && /[A-Z]/.test(password);
 }
-function validateEquipment(body) {
+async function resolveImgBBShareUrl(value) {
+  const url = String(value || '').trim();
+  if (!/^https?:\/\/(?:ibb\.co(?:\.com)?|www\.ibb\.co(?:\.com)?)\//i.test(url)) return url;
+  try {
+    const response = await fetch(url);
+    if (!response.ok) return url;
+    const html = await response.text();
+    const ogImage = html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i)
+      || html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i);
+    if (ogImage?.[1]) return ogImage[1].replace(/&amp;/g, '&');
+  } catch {
+    return url;
+  }
+  return url;
+}
+
+async function validateEquipment(body) {
   const fields = ['name', 'description', 'category', 'location', 'condition', 'brand', 'model', 'image', 'rentalTerms'];
   for (const key of fields) if (typeof body[key] !== 'string' || !body[key].trim()) fail(400, `${key} is required.`);
-  if (!/^https?:\/\//i.test(body.image)) fail(400, 'Equipment image must be a valid http(s) URL.');
+  const resolvedImage = await resolveImgBBShareUrl(body.image);
+  if (!/^https?:\/\//i.test(resolvedImage)) fail(400, 'Equipment image must be a valid http(s) URL.');
+  body.image = resolvedImage;
   if (!['Daily', 'Weekly', 'Monthly'].includes(body.rentalType)) fail(400, 'Choose a valid rental type.');
   if (!Number.isFinite(Number(body.price)) || Number(body.price) <= 0) fail(400, 'Price must be greater than zero.');
   if (!Number.isInteger(Number(body.quantity)) || Number(body.quantity) < 0) fail(400, 'Quantity must be a non-negative whole number.');
@@ -303,6 +321,11 @@ app.use(cors({ origin(origin, callback) {
 app.use(express.json({ limit: '1mb' }));
 app.get('/', (_req, res) => res.json({ name: 'RentGear API', status: 'ok' }));
 app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
+app.post('/api/images/resolve', express.json({ limit: '1mb' }), route(async (req, res) => {
+  const url = await resolveImgBBShareUrl(req.body.url);
+  if (!/^https?:\/\//i.test(url)) fail(400, 'Enter a valid image URL.');
+  res.json({ url });
+}));
 
 const issueLocalToken = (user) => jwt.sign(
   { sub: String(user._id), email: user.email, role: user.role },
@@ -525,7 +548,7 @@ app.get('/api/equipment/:id', route(async (req, res) => {
 }));
 
 app.post('/api/equipment', verifyToken, verifyOwner, route(async (req, res) => {
-  validateEquipment(req.body);
+  await validateEquipment(req.body);
   const item = {
     ...Object.fromEntries(['name', 'description', 'category', 'location', 'condition', 'brand', 'model', 'image', 'rentalTerms'].map((k) => [k, req.body[k].trim()])),
     price: Number(req.body.price), rentalType: req.body.rentalType, quantity: Number(req.body.quantity),
@@ -539,7 +562,7 @@ app.get('/api/owner/equipment', verifyToken, verifyOwner, route(async (req, res)
   res.json(await paginated(equipment, { ownerId: req.user._id }, req.query, { createdAt: -1 }, publicEquipment));
 }));
 app.put('/api/equipment/:id', verifyToken, verifyOwner, route(async (req, res) => {
-  validateEquipment(req.body);
+  await validateEquipment(req.body);
   const objectId = idOf(req.params.id); if (!objectId) fail(400, 'Invalid equipment id.');
   const update = { ...Object.fromEntries(['name', 'description', 'category', 'location', 'condition', 'brand', 'model', 'image', 'rentalTerms'].map((k) => [k, req.body[k].trim()])), price: Number(req.body.price), rentalType: req.body.rentalType, quantity: Number(req.body.quantity), status: 'pending', updatedAt: now() };
   const item = await equipment.findOneAndUpdate({ _id: objectId, ownerId: req.user._id }, { $set: update }, { returnDocument: 'after' });
@@ -790,7 +813,7 @@ app.patch('/api/admin/equipment/:id/status', verifyToken, verifyAdmin, route(asy
   res.json({ item: publicEquipment(item) });
 }));
 app.put('/api/admin/equipment/:id', verifyToken, verifyAdmin, route(async (req, res) => {
-  validateEquipment(req.body);
+  await validateEquipment(req.body);
   const objectId = idOf(req.params.id); if (!objectId) fail(400, 'Invalid equipment id.');
   const data = { ...Object.fromEntries(['name', 'description', 'category', 'location', 'condition', 'brand', 'model', 'image', 'rentalTerms'].map((k) => [k, req.body[k].trim()])), price: Number(req.body.price), quantity: Number(req.body.quantity), rentalType: req.body.rentalType, updatedAt: now() };
   const item = await equipment.findOneAndUpdate({ _id: objectId }, { $set: data }, { returnDocument: 'after' });
@@ -983,6 +1006,15 @@ async function start() {
   payments = db.collection('payments'); favorites = db.collection('favorites'); reviews = db.collection('reviews');
   const auth = createAuth(db);
   betterAuthHandler = toNodeHandler(auth);
+  const legacyImgBBLinks = equipment.find({
+    image: /^https?:\/\/(?:ibb\.co(?:\.com)?|www\.ibb\.co(?:\.com)?)\//i,
+  });
+  for await (const item of legacyImgBBLinks) {
+    const resolvedImage = await resolveImgBBShareUrl(item.image);
+    if (resolvedImage !== item.image) {
+      await equipment.updateOne({ _id: item._id }, { $set: { image: resolvedImage, updatedAt: now() } });
+    }
+  }
   await Promise.all([
     users.createIndex({ email: 1 }, { unique: true }),
     equipment.createIndex({ status: 1, createdAt: -1 }), equipment.createIndex({ ownerId: 1, createdAt: -1 }),
