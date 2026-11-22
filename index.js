@@ -33,14 +33,20 @@ const port = Number(process.env.PORT || 5000);
 const dbName = process.env.DB_NAME || 'rentgear';
 const jwtSecret = process.env.JWT_SECRET;
 const vercelUrl = process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : '';
-const authBaseUrl = (process.env.BETTER_AUTH_URL || vercelUrl || `http://localhost:${port}`).replace(/\/$/, '');
+const renderUrl = process.env.RENDER_EXTERNAL_URL ? process.env.RENDER_EXTERNAL_URL.replace(/\/$/, '') : '';
+const authBaseUrl = (process.env.BETTER_AUTH_URL || renderUrl || vercelUrl || `http://localhost:${port}`).replace(/\/$/, '');
 const betterAuthSecret = process.env.BETTER_AUTH_SECRET;
 const stripeKey = process.env.STRIPE_SECRET_KEY || '';
 const stripe = /^(?:sk|rk)_(?:test|live)_[A-Za-z0-9]+$/.test(stripeKey) && !/^(?:sk|rk)_(?:test|live)_x+$/i.test(stripeKey)
   ? new Stripe(stripeKey)
   : null;
-const clientOrigins = (process.env.CLIENT_URLS || process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000')
+const configuredClientOrigins = (process.env.CLIENT_URLS || process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000')
   .split(',').map((value) => value.trim()).filter(Boolean);
+const clientOrigins = [...new Set([
+  ...configuredClientOrigins,
+  'https://rentgear-ivory.vercel.app',
+  'http://localhost:3000',
+])];
 const adminEmails = new Set((process.env.ADMIN_EMAILS || '').split(',').map((x) => x.trim().toLowerCase()).filter(Boolean));
 const betterAuthJwks = createRemoteJWKSet(new URL(`${authBaseUrl}/api/auth/jwks`));
 
