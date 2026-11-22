@@ -18,8 +18,7 @@ checks, favorites, reviews, bookings, Stripe Checkout, analytics, and administra
 | --- | --- |
 | Project | RentGear - Equipment Rental Platform |
 | Assignment | Assignment 9 - Category 003 |
-| Admin Email | `mhabuhanif230@gmail.com` |
-| Admin Password | `Hanif15387126` |
+| Admin Credentials | Available to the project owner only |
 | Live API | https://equipment-rental-server.onrender.com |
 | Live Site | https://rentgear-ivory.vercel.app |
 
